@@ -21,9 +21,20 @@ def _neutral_cwd() -> str:
     hooks/MCPs — neither the user's ~/.claude/settings.json nor any project
     .claude/settings.json. Subscription auth still works because credentials
     live in ~/.claude/.credentials.json and aren't controlled by
-    --setting-sources."""
+    --setting-sources.
+
+    Security: the whole premise hinges on this directory staying empty of
+    settings files. If another local user could drop a .claude dir inside,
+    their hooks would fire inside our claude -p subprocess."""
     path = DATA_DIR / "rewrite_sandbox"
-    path.mkdir(parents=True, exist_ok=True)
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # mkdir(mode=) is a no-op when the dir already exists, so chmod after.
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+    if path.is_symlink():
+        raise RuntimeError(f"rewrite_sandbox is a symlink ({path}); refusing to run")
     return str(path)
 
 

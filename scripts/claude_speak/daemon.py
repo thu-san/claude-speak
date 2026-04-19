@@ -409,14 +409,27 @@ def _safe_mtime(p: Path) -> float | None:
 def serve() -> None:
     """Bind the socket and accept connections forever."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # Owner-only on the data dir — transcripts, recordings, voice logs all
+    # live here; no reason another local user should read them.
+    try:
+        DATA_DIR.chmod(0o700)
+    except OSError:
+        pass
 
     if not _acquire_start_lock():
         log("daemon already running (start lock held); exiting")
         return
 
-    # Now safe to clean up a stale socket from a previously-killed daemon.
-    if SOCKET_PATH.exists():
+    # Only unlink the stale socket if it's a real socket we own (not a
+    # symlink planted by another local user between our unlink and bind).
+    if SOCKET_PATH.exists() or SOCKET_PATH.is_symlink():
         try:
+            st = SOCKET_PATH.lstat()
+            import stat as _stat
+            if _stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid():
+                log(f"refusing to unlink suspicious {SOCKET_PATH} "
+                    f"(symlink={_stat.S_ISLNK(st.st_mode)} uid={st.st_uid})")
+                return
             SOCKET_PATH.unlink()
         except FileNotFoundError:
             pass
@@ -442,7 +455,19 @@ def serve() -> None:
     _start_code_watchdog()
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.bind(str(SOCKET_PATH))
+    # Bind under a restrictive umask so the socket inode lands with
+    # owner-only permissions. Any other local user connecting to our
+    # socket could make us speak arbitrary text or kill our processes.
+    prev_umask = os.umask(0o077)
+    try:
+        sock.bind(str(SOCKET_PATH))
+    finally:
+        os.umask(prev_umask)
+    # Belt-and-suspenders in case the umask dance didn't take (e.g. NFS).
+    try:
+        os.chmod(str(SOCKET_PATH), 0o600)
+    except OSError:
+        pass
     sock.listen(8)
     try:
         while True:
