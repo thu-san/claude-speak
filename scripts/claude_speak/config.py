@@ -6,26 +6,39 @@ import os
 from pathlib import Path
 
 
+CANONICAL_DIR_NAME = "claude-speak-thu-san"
+
+
 def data_dir() -> Path:
     """Resolve the plugin's persistent data dir.
 
     Order of preference:
       1. CLAUDE_PLUGIN_DATA — set by Claude Code for hook subprocesses.
-      2. Any existing ~/.claude/plugins/data/claude-speak-* directory (matches
-         whatever marketplace the plugin was installed from).
-      3. Pin to the canonical path for the published marketplace so terminal
-         invocations land in the SAME place the hook will use.
+         Always wins. This is the only source of truth for "which marketplace
+         is actually active in the current session."
+      2. The most-recently-modified `~/.claude/plugins/data/claude-speak-*`
+         directory. Terminal invocations don't get CLAUDE_PLUGIN_DATA, so we
+         use recency as a proxy for "whichever install the user was just
+         using." That tracks correctly when the user has multiple
+         side-by-side installs (e.g. an @claude-speak-local dev install next
+         to a stale @thu-san from an earlier experiment) — the one Claude
+         Code just wrote to via the hook wins.
+      3. Fall back to the canonical path for the published marketplace.
     """
     d = os.environ.get("CLAUDE_PLUGIN_DATA")
     if d:
         return Path(d)
     base = Path.home() / ".claude" / "plugins" / "data"
     if base.is_dir():
-        for entry in sorted(base.iterdir()):
-            if entry.is_dir() and entry.name.startswith("claude-speak"):
-                return entry
-    # Canonical path used by `/plugin install claude-speak@thu-san`.
-    return base / "claude-speak-thu-san"
+        candidates = [
+            e for e in base.iterdir()
+            if e.is_dir() and e.name.startswith("claude-speak")
+        ]
+        if candidates:
+            # Newest wins. Ties broken alphabetically for stability.
+            candidates.sort(key=lambda p: (-p.stat().st_mtime, p.name))
+            return candidates[0]
+    return base / CANONICAL_DIR_NAME
 
 
 DATA_DIR = data_dir()
