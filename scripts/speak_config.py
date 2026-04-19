@@ -168,6 +168,9 @@ def status() -> None:
     print(f"afplay:      {'yes' if shutil.which('afplay') else 'no'}")
     print(f"whisper-cli: {'yes' if shutil.which('whisper-cli') else 'not yet (first use will brew install)'}")
     print(f"data dir:    {DATA_DIR}")
+    log_path = DATA_DIR / "speak.log"
+    log_hint = f"{log_path} ({log_path.stat().st_size // 1024}KB)" if log_path.exists() else f"{log_path} (not yet written)"
+    print(f"log file:    {log_hint}")
 
 
 def main(argv: list[str]) -> int:
@@ -238,6 +241,20 @@ def main(argv: list[str]) -> int:
         cfg["log_verbose"] = rest[0] == "on"
     elif cmd == "status":
         status()
+        return 0
+    elif cmd == "log":
+        log_path = DATA_DIR / "speak.log"
+        if not log_path.exists():
+            print(f"log not yet written: {log_path}")
+            return 0
+        # Default to last 40 lines; user can pass an int to override.
+        n = 40
+        if rest and rest[0].lstrip("-").isdigit():
+            n = int(rest[0].lstrip("-"))
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        for line in lines[-n:]:
+            print(line, end="")
         return 0
     elif cmd == "install":
         from claude_speak.install import install_all, MARKER
