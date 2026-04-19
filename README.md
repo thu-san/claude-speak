@@ -187,7 +187,9 @@ Slash command equivalents: `/claude-speak:whisper-tiny` · `whisper-base` · `wh
 
 ## Fixtures
 
-`scripts/fixtures/input.txt` — ~1500 characters, 17 sentences, intentionally varied (decimals, semicolons, short/long sentences). Use it as a benchmarking input for the Kokoro CLI:
+Two test inputs ship under `scripts/fixtures/`:
+
+**`input.txt`** — ~1500 characters, 17 sentences, intentionally varied (decimals, semicolons, short/long sentences). Use it as a benchmarking input for the Kokoro CLI:
 
 ```bash
 cd scripts
@@ -195,6 +197,18 @@ python3 -m claude_speak.tts.kokoro --file fixtures/input.txt --no-play
 ```
 
 Default mode is overlapped per-sentence (sentence N+1 renders while sentence N plays). `--no-play` disables the player so you get clean synthesis timings. Use `--whole` to disable per-sentence and synthesize everything in one call.
+
+**`rewrite_input.txt`** — ~1.8KB realistic assistant reply (prose + a Go code block + a numbered list + inline backticks + a trailing question). Use it to exercise the rewrite path — handy when you're debugging `claude -p` timeouts or comparing rewrite prompts:
+
+```bash
+cd scripts
+python3 -m claude_speak.rewrite --file fixtures/rewrite_input.txt
+time python3 -m claude_speak.rewrite --file fixtures/rewrite_input.txt --model sonnet
+
+# full rewrite → TTS chain on a known input
+python3 -m claude_speak.rewrite --file fixtures/rewrite_input.txt \
+  | python3 -m claude_speak.tts.kokoro
+```
 
 ## Tests
 
