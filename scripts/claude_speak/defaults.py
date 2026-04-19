@@ -56,4 +56,17 @@ DEFAULTS = {
     # When true, the Stop hook talks to a long-running background daemon that
     # keeps Silero+Kokoro warm in memory (~2-3s per-turn cold-start savings).
     "daemon": True,
+
+    # ---- Notifications ----
+    # When true, Claude Code's Notification hook (permission prompts, MCP
+    # elicitation dialogs, idle reminders, auth success) speaks the message
+    # aloud so you can tell the UI is waiting for you without looking.
+    # Message is spoken verbatim (no rewrite); speak-only (no voice reply).
+    "speak_notifications": True,
+    "speak_notification_types": {
+        "permission_prompt": True,
+        "elicitation_dialog": True,
+        "idle_prompt": True,
+        "auth_success": False,
+    },
 }

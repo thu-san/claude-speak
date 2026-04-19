@@ -129,6 +129,17 @@ def run_turn(req: dict, *, forked_fallback: bool = False) -> str:
     """One full conversational turn. Returns the decision:block JSON string
     for the shim to print (or '' when there's nothing to feed back).
 
+    Request schema:
+      - transcript_path: read last user/assistant turn from this JSONL, go
+        through rewrite → synth → play. This is the Stop-hook path.
+      - text: pre-built text to speak; skips the transcript read. Used by
+        the Notification hook so short messages are spoken verbatim without
+        the 3-5s claude -p floor.
+      - rewrite (default True): if False and `text` given, skip the rewrite
+        step and speak `text` verbatim.
+      - voice_loop (default = cfg.voice_loop): if False, speak-only; no mic
+        recording afterward. Explicit override wins over the config value.
+
     `forked_fallback=False` (default, daemon path): everything runs in this
     process; no subprocess forking. Playback is streamed synchronously so
     the listen step can start right after audio ends.
@@ -140,25 +151,41 @@ def run_turn(req: dict, *, forked_fallback: bool = False) -> str:
     cfg = load_config(DEFAULTS)
     if not cfg.get("enabled", True):
         return ""
-    transcript_path = req.get("transcript_path") or ""
-    user_text, assistant_text = read_last_turn(transcript_path)
-    if not assistant_text or len(assistant_text) < 4:
-        return ""
-    max_chars = int(cfg.get("max_chars", 1200))
-    text = build_rewrite_input(user_text, assistant_text, max_chars)
+
+    direct_text = req.get("text")
+    do_rewrite = bool(req.get("rewrite", True))
+    if "voice_loop" in req:
+        voice_loop = bool(req["voice_loop"])
+    else:
+        voice_loop = _resolve_voice_loop(cfg)
+
+    if direct_text is not None:
+        # Notification-style path: pre-built text, no transcript read.
+        user_text = ""
+        assistant_text = direct_text
+        text = direct_text
+    else:
+        transcript_path = req.get("transcript_path") or ""
+        user_text, assistant_text = read_last_turn(transcript_path)
+        if not assistant_text or len(assistant_text) < 4:
+            return ""
+        max_chars = int(cfg.get("max_chars", 1200))
+        text = build_rewrite_input(user_text, assistant_text, max_chars)
+        log_v(f"transcript={transcript_path}")
 
     voice = cfg.get("kokoro_voice")
     rate = float(cfg.get("playback_rate", 1.0))
-    voice_loop = _resolve_voice_loop(cfg)
     mode = _resolve_mode(cfg)
-    use_pipeline = (mode == "stream")
+    # Pre-built text skips rewrite, so streaming-rewrite gains nothing —
+    # force buffered path for that case.
+    use_pipeline = (mode == "stream") and do_rewrite and (direct_text is None)
 
     section("🎤 TURN")
     log(f"📥 in: user={len(user_text)}c assistant={len(assistant_text)}c "
-        f"voice={voice} rate={rate}x mode={mode} voice_loop={voice_loop}")
+        f"voice={voice} rate={rate}x mode={mode} voice_loop={voice_loop} "
+        f"rewrite={do_rewrite} direct_text={direct_text is not None}")
     if user_text:
         log(f"   user: {user_text[:200]!r}")
-    log_v(f"transcript={transcript_path}")
 
     if use_pipeline:
         # In voice-loop mode we must run playback synchronously so the listen
@@ -189,14 +216,20 @@ def run_turn(req: dict, *, forked_fallback: bool = False) -> str:
             return ""
         return _listen_and_emit(cfg) if voice_loop else ""
 
-    # Buffered path: synthesize the whole rewrite as one audio chunk.
+    # Buffered path: synthesize the whole text as one audio chunk.
     try:
-        spoken = rewrite(text, cfg)
-        if not spoken:
-            log("❌ rewrite returned empty")
-            return ""
-        log(f"✍️  rewrite done → {len(spoken)}c")
-        log(f"   speech: {spoken[:400]!r}")
+        if do_rewrite:
+            spoken = rewrite(text, cfg)
+            if not spoken:
+                log("❌ rewrite returned empty")
+                return ""
+            log(f"✍️  rewrite done → {len(spoken)}c")
+            log(f"   speech: {spoken[:400]!r}")
+        else:
+            # Verbatim path — used for notifications / any caller that passes
+            # text directly and has no use for the rewrite step.
+            spoken = text
+            log(f"   speech verbatim: {spoken[:400]!r}")
         audio, ext = synthesize(spoken, cfg)
         if not audio:
             log("tts synthesis returned no audio")

@@ -41,7 +41,7 @@ def show() -> None:
     # Only print the knobs users actually interact with.
     visible_keys = [
         "enabled", "kokoro_voice", "kokoro_speed", "playback_rate",
-        "mode", "voice_loop", "record_mute_system",
+        "mode", "voice_loop", "speak_notifications", "record_mute_system",
         "claude_model", "record_silence_seconds",
     ]
     print(json.dumps({k: cfg.get(k) for k in visible_keys}, indent=2))
@@ -221,6 +221,8 @@ def main(argv: list[str]) -> int:
         on = rest[0] == "on"
         cfg["voice_loop"] = on
         cfg["auto_dictation"] = on
+    elif cmd == "notifications" and rest and rest[0] in ("on", "off"):
+        cfg["speak_notifications"] = rest[0] == "on"
     elif cmd == "mute" and rest and rest[0] in ("on", "off"):
         cfg["record_mute_system"] = rest[0] == "on"
     elif cmd == "model" and rest:
