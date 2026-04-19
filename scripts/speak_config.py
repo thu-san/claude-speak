@@ -41,7 +41,7 @@ def show() -> None:
     # Only print the knobs users actually interact with.
     visible_keys = [
         "enabled", "kokoro_voice", "kokoro_speed", "playback_rate",
-        "mode", "auto_dictation", "record_mute_system",
+        "mode", "voice_loop", "record_mute_system",
         "claude_model", "record_silence_seconds",
     ]
     print(json.dumps({k: cfg.get(k) for k in visible_keys}, indent=2))
@@ -216,7 +216,11 @@ def main(argv: list[str]) -> int:
         # drop legacy key if present so the two don't disagree
         cfg.pop("pipeline_sentences", None)
     elif cmd == "dictate" and rest and rest[0] in ("on", "off"):
-        cfg["auto_dictation"] = rest[0] == "on"
+        # Renamed to voice_loop; set both for back-compat while older code
+        # (or running daemon) is still around.
+        on = rest[0] == "on"
+        cfg["voice_loop"] = on
+        cfg["auto_dictation"] = on
     elif cmd == "mute" and rest and rest[0] in ("on", "off"):
         cfg["record_mute_system"] = rest[0] == "on"
     elif cmd == "model" and rest:
