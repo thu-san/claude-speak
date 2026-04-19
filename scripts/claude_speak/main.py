@@ -30,7 +30,12 @@ from .transcript import build_rewrite_input, read_last_turn
 from .tts import synthesize
 
 PID_FILE = DATA_DIR / "player.pid"
-DAEMON_PID_FILE = DATA_DIR / "daemon.pid"
+# Pid of the forked pipeline process used by the in-process fallback path
+# (`forked_fallback=True` in run_turn). NOT the long-running daemon's pid —
+# that one is owned by daemon.py and lives at DATA_DIR/daemon.pid. Keeping
+# the two paths distinct avoids the footgun where _kill_previous reads the
+# real daemon's pid file and SIGTERMs the daemon itself.
+PIPELINE_PID_FILE = DATA_DIR / "pipeline.pid"
 
 
 def _pid_is_ours(pid: int) -> bool:
@@ -47,20 +52,20 @@ def _pid_is_ours(pid: int) -> bool:
 def _kill_previous() -> None:
     """Kill OUR last playback / pipeline daemon. Used to be a `pkill -f
     ffplay` which would also nuke unrelated user processes. Now scoped to
-    the pids we actually wrote to PID_FILE / DAEMON_PID_FILE — and further
+    the pids we actually wrote to PID_FILE / PIPELINE_PID_FILE — and further
     guarded by an ownership check so a stale PID file that got reused by
     someone else's process doesn't cause us to SIGKILL strangers."""
     killed = False
-    if DAEMON_PID_FILE.exists():
+    if PIPELINE_PID_FILE.exists():
         try:
-            pid = int(DAEMON_PID_FILE.read_text().strip())
+            pid = int(PIPELINE_PID_FILE.read_text().strip())
             if _pid_is_ours(pid):
                 os.killpg(pid, signal.SIGTERM)
                 killed = True
         except (ProcessLookupError, ValueError, PermissionError):
             pass
         try:
-            DAEMON_PID_FILE.unlink()
+            PIPELINE_PID_FILE.unlink()
         except FileNotFoundError:
             pass
     if PID_FILE.exists():
@@ -227,13 +232,13 @@ def run_turn(req: dict, *, forked_fallback: bool = False) -> str:
             _daemonize()
             try:
                 DATA_DIR.mkdir(parents=True, exist_ok=True)
-                DAEMON_PID_FILE.write_text(str(os.getpid()))
+                PIPELINE_PID_FILE.write_text(str(os.getpid()))
                 _run_pipeline(cfg, text, do_rewrite=do_rewrite)
             except Exception as e:
                 log(f"❌ pipeline error: {type(e).__name__}: {e}")
             finally:
                 try:
-                    DAEMON_PID_FILE.unlink()
+                    PIPELINE_PID_FILE.unlink()
                 except FileNotFoundError:
                     pass
             os._exit(0)
