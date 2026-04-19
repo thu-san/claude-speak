@@ -175,6 +175,15 @@ python3 -m claude_speak.stt ~/.claude/plugins/data/claude-speak-thu-san/input.wa
 python3 -m claude_speak.stt ~/.claude/plugins/data/claude-speak-thu-san/input.wav \
     --model ggml-tiny.en.bin --threads 8
 
+# End-to-end: run the FULL Stop-hook pipeline against canned input.
+# rewrite → TTS → speak → listen → STT → prints the transcribed reply.
+# This is what fires when Claude finishes a turn — just sourced from a
+# file / --text instead of a live transcript. Each phase is timed in
+# speak.log so you can see exactly where seconds go.
+python3 -m claude_speak turn --file fixtures/rewrite_input.txt
+python3 -m claude_speak turn --text "Done — all 37 tests passing on ARM."
+python3 -m claude_speak turn --file fixtures/rewrite_input.txt --no-daemon
+
 # Daemon control + persistent whisper-model switch
 python3 -m claude_speak.stt --restart-daemon
 python3 -m claude_speak.stt --set-model ggml-large-v3-turbo-q5_0.bin
