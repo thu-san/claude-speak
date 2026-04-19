@@ -36,3 +36,7 @@ To get a separate data dir during dev, the maintainer manually edits the file to
 - `main` and any release branch: `marketplace.json:name = "thu-san"`. Always. If a commit on `main` shows otherwise, that's a mistake — revert.
 - Dev branches and dirty working trees: can have `"local"`. Safe to keep locally; unsafe to commit.
 - Claude sessions: guard commits against the dev override leaking in.
+
+## `.env` is per-machine, auto-generated — never commit it
+
+`install.py` writes `<plugin_root>/.env` during SessionStart, containing this machine's `CLAUDE_PLUGIN_DATA=...` so the user can `source .env` for terminal CLI use. It's gitignored, but if you ever see it appear in `git status` as untracked and tempting to add — don't. It's per-machine and commits would leak absolute home paths + pin everyone else's terminal to your dir.

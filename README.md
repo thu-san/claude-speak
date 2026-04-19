@@ -126,24 +126,35 @@ Relevant fields:
 
 Override `CLAUDE_SPEAK=0` in the environment to mute for a single session.
 
-## Developing against a local marketplace
+## Terminal CLI: source the auto-generated `.env`
 
-If you've installed claude-speak from a **local checkout** (e.g. `/plugin marketplace add /path/to/claude-speak`) instead of from GitHub (`thu-san/claude-speak`), your install's data dir is `~/.claude/plugins/data/claude-speak-<your-marketplace-name>/` — not the production default `claude-speak-thu-san/`.
+Claude Code sets `CLAUDE_PLUGIN_DATA` automatically for hooks (Stop / Notification / SessionStart) and slash commands (our templates inject it). **Raw-terminal invocations** (`python3 -m claude_speak.stt`, `… .rewrite`, `… turn`, `speak_config.py`) don't get that for free — they'll raise a clear error if the env var is missing.
 
-Claude Code sets `CLAUDE_PLUGIN_DATA` correctly for hook invocations, so the Stop / Notification / SessionStart flow always finds the right dir. But **terminal commands** (`python3 -m claude_speak.stt`, `… .rewrite`, `… turn`, etc.) have no hook context and default to `claude-speak-thu-san`. Set the env var in your shell rc so terminal commands follow your local install:
-
-```bash
-# ~/.zshrc (or ~/.bashrc)
-export CLAUDE_PLUGIN_DATA=~/.claude/plugins/data/claude-speak-<your-marketplace-name>
-```
-
-Example — if your marketplace is named `claude-speak-local`:
+The SessionStart hook writes the right value into `<plugin_root>/.env` on every install / session start, so all you need to do is source it in your shell:
 
 ```bash
-export CLAUDE_PLUGIN_DATA=~/.claude/plugins/data/claude-speak-claude-speak-local
+# once per terminal session, from the plugin checkout
+set -a; source .env; set +a
+python3 -m claude_speak.stt
+# ... any other terminal CLI now works
 ```
 
-Production users (`claude-speak@thu-san` from GitHub) never need to set this — they get the canonical dir automatically.
+`.env` contains one line: `CLAUDE_PLUGIN_DATA=/Users/you/.claude/plugins/data/claude-speak-<marketplace>`. It's auto-regenerated every SessionStart, so switching between installs (`@thu-san` ↔ `@local`) keeps it in sync — no manual edits.
+
+**Alternatives** if sourcing manually feels clunky:
+
+- **VSCode integrated terminal** inherits the right env if you add this to `.vscode/settings.json` (note the hardcoded path, so you lose the auto-refresh — update if you switch installs):
+  ```jsonc
+  {
+    "terminal.integrated.env.osx": {
+      "CLAUDE_PLUGIN_DATA": "/Users/you/.claude/plugins/data/claude-speak-local"
+    }
+  }
+  ```
+
+- **direnv** users: drop `dotenv` in a `.envrc`, run `direnv allow` once, and every `cd` into the checkout auto-loads `.env`.
+
+Gitignored. Never committed. Python never reads `.env` itself — the shell has to load it.
 
 ## Testing individual modules from the CLI
 
