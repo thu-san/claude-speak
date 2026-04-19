@@ -80,7 +80,6 @@ def usage() -> None:
         f"(default: {'on' if d['log_verbose'] else 'off'})\n"
         "  install [--force]         — pre-download all models/deps (runs automatically\n"
         "                              on first session; --force re-runs)\n"
-        "  uninstall [--wipe-logs]   — delete venv, models, config; requires --force\n"
         "  progress [--follow]       — show install log lines (snapshot or live stream)\n"
         "  status                    — show current config + tooling availability\n"
         "\n"
@@ -291,20 +290,6 @@ def main(argv: list[str]) -> int:
             _follow_install_log()
             return 0
         ok = install_all(cfg=merged(), quiet=False)
-        return 0 if ok else 1
-    elif cmd == "uninstall":
-        from claude_speak.install import uninstall_all
-        from claude_speak.config import DATA_DIR as _DD
-        if "--force" not in rest:
-            print(f"This will wipe {_DD}")
-            print("  - .venv/ (plugin-private Python env, ~1GB)")
-            print("  - kokoro/ and models/ (downloaded TTS and STT models)")
-            print("  - config.json, markers, lockfile")
-            print()
-            print("Pass --force to confirm (add --wipe-logs to also delete speak.log).")
-            return 1
-        wipe_logs = "--wipe-logs" in rest
-        ok = uninstall_all(keep_log=not wipe_logs, quiet=False)
         return 0 if ok else 1
     elif cmd == "progress":
         follow = "--follow" in rest
