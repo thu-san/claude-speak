@@ -42,8 +42,12 @@ DEFAULTS = {
     "mode": "stream",
     "playback_rate": 1.0,
     "max_chars": 1200,
-    # ---- Auto-dictation loop ----
-    "auto_dictation": False,
+    # ---- Conversational turn ----
+    # When true, after speaking Claude's reply the hook records the user's
+    # voice reply and feeds it back as Claude's next prompt (full voice loop).
+    # When false, the hook only speaks — no listening afterward.
+    # Back-compat: falls back to "auto_dictation" if present in old configs.
+    "voice_loop": True,
 
     # ---- Logging ----
     "log_verbose": False,                 # if true, also log per-sentence/per-step detail
@@ -52,4 +56,17 @@ DEFAULTS = {
     # When true, the Stop hook talks to a long-running background daemon that
     # keeps Silero+Kokoro warm in memory (~2-3s per-turn cold-start savings).
     "daemon": True,
+
+    # ---- Notifications ----
+    # When true, Claude Code's Notification hook (permission prompts, MCP
+    # elicitation dialogs, idle reminders, auth success) speaks the message
+    # aloud so you can tell the UI is waiting for you without looking.
+    # Message is spoken verbatim (no rewrite); speak-only (no voice reply).
+    "speak_notifications": True,
+    "speak_notification_types": {
+        "permission_prompt": True,
+        "elicitation_dialog": True,
+        "idle_prompt": True,
+        "auth_success": False,
+    },
 }

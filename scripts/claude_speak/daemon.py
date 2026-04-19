@@ -44,6 +44,11 @@ PID_FILE = DATA_DIR / "daemon.pid"
 START_LOCK = DATA_DIR / "daemon.start.lock"
 
 
+_MAX_MSG_BYTES = 1 * 1024 * 1024  # 1 MiB — one speak/dictate payload is < 10 KiB;
+                                   # cap is only here to stop pathological
+                                   # clients from OOM'ing the daemon.
+
+
 # ---- client side ----
 
 def _socket_alive() -> bool:
@@ -77,13 +82,16 @@ def send_request(req: dict, timeout: float = 600.0) -> dict | None:
         return None
     try:
         s.sendall((json.dumps(req) + "\n").encode("utf-8"))
-        # Read until newline.
+        # Read until newline, capped so a buggy server can't OOM us.
         buf = b""
         while b"\n" not in buf:
             chunk = s.recv(4096)
             if not chunk:
                 break
             buf += chunk
+            if len(buf) > _MAX_MSG_BYTES:
+                log(f"daemon reply exceeded {_MAX_MSG_BYTES} bytes; aborting")
+                return None
         if not buf:
             return None
         line, _, _ = buf.partition(b"\n")
@@ -98,25 +106,23 @@ def send_request(req: dict, timeout: float = 600.0) -> dict | None:
             pass
 
 
-def ensure_daemon() -> bool:
-    """If the daemon isn't running, fork a detached child to start it.
-    Returns True if the daemon is alive AND responsive after this call.
+def _spawn_daemon() -> None:
+    """Fork + detach + exec the daemon. Parent returns immediately.
 
-    Healthcheck: a wedged daemon may still hold the socket — we send a
-    status RPC with a tight timeout to confirm the request loop is alive.
-    If it isn't, kill the held pid (if known) and respawn."""
-    if _socket_alive():
-        if _daemon_responsive():
-            return True
-        log("daemon socket alive but unresponsive — killing and respawning")
-        _kill_held_daemon()
-    log("starting daemon (background)…")
-    # Spawn `python -m claude_speak.daemon serve --background`
+    PYTHONPATH is set explicitly to the scripts/ directory so `python -m
+    claude_speak.daemon` resolves the package regardless of the exec'd
+    child's cwd. Without this, the daemon would only start when the caller
+    happened to be running from scripts/ — broken for hook invocations
+    whose cwd is the user's project dir, not ours."""
     from .venv import VENV_PYTHON, venv_ready
     py = str(VENV_PYTHON) if venv_ready() else sys.executable
+    # claude_speak/daemon.py → claude_speak/.. = scripts/
+    scripts_dir = str(Path(__file__).resolve().parent.parent)
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = scripts_dir + (os.pathsep + existing if existing else "")
     pid = os.fork()
     if pid == 0:
-        # Child: detach and exec.
         os.setsid()
         if os.fork() > 0:
             os._exit(0)
@@ -126,14 +132,54 @@ def ensure_daemon() -> bool:
                 os.dup2(devnull, fd)
             except OSError:
                 pass
-        os.execv(py, [py, "-m", "claude_speak.daemon", "serve"])
-    # Parent: wait briefly for the socket to come up.
-    deadline = time.monotonic() + 30
+        os.execve(py, [py, "-m", "claude_speak.daemon", "serve"], env)
+
+
+def _wait_for_socket(timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if _socket_alive():
             return True
         time.sleep(0.1)
-    log("daemon failed to start within 30s")
+    return False
+
+
+def ensure_daemon() -> bool:
+    """If the daemon isn't running, fork a detached child to start it.
+    Returns True if the daemon is alive AND responsive after this call.
+
+    Two recovery paths for wedged state:
+      * Socket alive but unresponsive → status RPC times out → kill holder,
+        respawn.
+      * No socket AND spawn timed out → a prior crashed daemon left a stale
+        start.lock (with a still-live pid that's stuck in preload / import /
+        etc.). The fresh spawn's _acquire_start_lock sees 'another daemon
+        running' and silently exits without binding. Detect this by timeout,
+        wipe the holder, retry ONCE. Without this, every subsequent hook
+        call times out the same way until the user manually intervenes.
+    """
+    if _socket_alive():
+        if _daemon_responsive():
+            return True
+        log("daemon socket alive but unresponsive — killing and respawning")
+        _kill_held_daemon()
+    log("starting daemon (background)…")
+    # Cold-start preload of Silero + Kokoro can take 20-35s on Intel CPU;
+    # 60s gives enough headroom without forcing a fallback on every spawn.
+    wait_s = 60
+    _spawn_daemon()
+    if _wait_for_socket(wait_s):
+        return True
+    # Spawn timed out. Usually means a stale/wedged predecessor is holding
+    # the start.lock — our child saw the held lock, bailed silently. Wipe
+    # and retry once.
+    log(f"daemon failed to start within {wait_s}s — attempting recovery")
+    _kill_held_daemon()
+    _spawn_daemon()
+    if _wait_for_socket(wait_s):
+        log("daemon recovered after second spawn")
+        return True
+    log(f"daemon still down after recovery attempt; falling back to in-process")
     return False
 
 
@@ -146,24 +192,42 @@ def _daemon_responsive() -> bool:
     return bool(resp and resp.get("ok"))
 
 
+def _pid_is_ours(pid: int) -> bool:
+    """True if `pid` is alive AND owned by the current user.
+
+    os.kill(pid, 0) raises PermissionError when the PID exists but belongs
+    to someone else (common after a reboot + PID reuse), ProcessLookupError
+    when the PID isn't live. We signal only when neither error fires."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
 def _kill_held_daemon() -> None:
     """Best-effort: terminate the daemon process named in PID_FILE, then
-    clean up its socket / pid / start lock so a fresh spawn can bind."""
+    clean up its socket / pid / start lock so a fresh spawn can bind.
+
+    Only signals the PID if ownership looks right — stale PID files are
+    routine here (crashes, reboots), and on macOS PIDs recycle fast, so
+    naive `os.kill(pid_from_file)` could SIGKILL a stranger."""
     if PID_FILE.exists():
         try:
             pid = int(PID_FILE.read_text().strip())
-            os.kill(pid, signal.SIGTERM)
-            for _ in range(20):
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    break
-                time.sleep(0.1)
+            if not _pid_is_ours(pid):
+                log(f"stale/foreign pid {pid} in {PID_FILE.name}; skipping kill")
             else:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                os.kill(pid, signal.SIGTERM)
+                for _ in range(20):
+                    if not _pid_is_ours(pid):
+                        break
+                    time.sleep(0.1)
+                else:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
         except (ValueError, ProcessLookupError, PermissionError):
             pass
     for p in (SOCKET_PATH, PID_FILE, START_LOCK):
@@ -237,18 +301,20 @@ def _handle(req: dict) -> dict:
                 return {"ok": False, "error": str(e)}
             finally:
                 _in_flight[0] = False
-    if op == "speak":
-        # Serialize speak requests; new request kills any in-flight playback.
-        from .main import _kill_previous, run_speak_via_daemon
+    # "turn" is the full conversational turn (rewrite → speak → listen →
+    # feedback). "speak" is kept as an alias for one release so pre-rename
+    # shims don't immediately break after a user pulls.
+    if op in ("turn", "speak"):
+        from .main import _kill_previous, run_turn
         if _in_flight[0]:
             _kill_previous()
         with _request_lock:
             _in_flight[0] = True
             try:
-                stdout = run_speak_via_daemon(req)
+                stdout = run_turn(req)
             except Exception as e:
                 import traceback
-                log(f"daemon speak error: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+                log(f"daemon turn error: {type(e).__name__}: {e}\n{traceback.format_exc()}")
                 return {"ok": False, "error": str(e)}
             finally:
                 _in_flight[0] = False
@@ -265,6 +331,14 @@ def _client_thread(conn: socket.socket) -> None:
             if not chunk:
                 return
             buf += chunk
+            if len(buf) > _MAX_MSG_BYTES:
+                try:
+                    conn.sendall(
+                        (json.dumps({"ok": False, "error": "request too large"})
+                         + "\n").encode("utf-8"))
+                except OSError:
+                    pass
+                return
         line, _, _ = buf.partition(b"\n")
         try:
             req = json.loads(line.decode("utf-8"))
@@ -341,18 +415,33 @@ def _start_code_watchdog() -> None:
     def _watch() -> None:
         while True:
             time.sleep(30)
+            # Check _in_flight first as a cheap bailout, then acquire the
+            # request lock non-blocking — if we can't grab it, a request is
+            # either in flight or about to start and we must NOT exit this
+            # tick. Without this serialization, os._exit(0) can race an
+            # arriving request and leave the client hung until its 60/600s
+            # socket timeout.
             if _in_flight[0]:
                 continue
-            for p, t0 in snapshot.items():
-                t = _safe_mtime(p)
-                if t is not None and t0 is not None and t > t0:
-                    log(f"code change detected in {p.name} → shutting down (will respawn)")
-                    for q in (SOCKET_PATH, PID_FILE, START_LOCK):
-                        try:
-                            q.unlink()
-                        except FileNotFoundError:
-                            pass
-                    os._exit(0)
+            if not _request_lock.acquire(blocking=False):
+                continue
+            try:
+                # Recheck under lock — state could have changed between the
+                # unlocked check and here.
+                if _in_flight[0]:
+                    continue
+                for p, t0 in snapshot.items():
+                    t = _safe_mtime(p)
+                    if t is not None and t0 is not None and t > t0:
+                        log(f"code change detected in {p.name} → shutting down (will respawn)")
+                        for q in (SOCKET_PATH, PID_FILE, START_LOCK):
+                            try:
+                                q.unlink()
+                            except FileNotFoundError:
+                                pass
+                        os._exit(0)
+            finally:
+                _request_lock.release()
     threading.Thread(target=_watch, daemon=True).start()
 
 
@@ -389,14 +478,27 @@ def _safe_mtime(p: Path) -> float | None:
 def serve() -> None:
     """Bind the socket and accept connections forever."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # Owner-only on the data dir — transcripts, recordings, voice logs all
+    # live here; no reason another local user should read them.
+    try:
+        DATA_DIR.chmod(0o700)
+    except OSError:
+        pass
 
     if not _acquire_start_lock():
         log("daemon already running (start lock held); exiting")
         return
 
-    # Now safe to clean up a stale socket from a previously-killed daemon.
-    if SOCKET_PATH.exists():
+    # Only unlink the stale socket if it's a real socket we own (not a
+    # symlink planted by another local user between our unlink and bind).
+    if SOCKET_PATH.exists() or SOCKET_PATH.is_symlink():
         try:
+            st = SOCKET_PATH.lstat()
+            import stat as _stat
+            if _stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid():
+                log(f"refusing to unlink suspicious {SOCKET_PATH} "
+                    f"(symlink={_stat.S_ISLNK(st.st_mode)} uid={st.st_uid})")
+                return
             SOCKET_PATH.unlink()
         except FileNotFoundError:
             pass
@@ -422,7 +524,19 @@ def serve() -> None:
     _start_code_watchdog()
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.bind(str(SOCKET_PATH))
+    # Bind under a restrictive umask so the socket inode lands with
+    # owner-only permissions. Any other local user connecting to our
+    # socket could make us speak arbitrary text or kill our processes.
+    prev_umask = os.umask(0o077)
+    try:
+        sock.bind(str(SOCKET_PATH))
+    finally:
+        os.umask(prev_umask)
+    # Belt-and-suspenders in case the umask dance didn't take (e.g. NFS).
+    try:
+        os.chmod(str(SOCKET_PATH), 0o600)
+    except OSError:
+        pass
     sock.listen(8)
     try:
         while True:

@@ -41,7 +41,7 @@ def show() -> None:
     # Only print the knobs users actually interact with.
     visible_keys = [
         "enabled", "kokoro_voice", "kokoro_speed", "playback_rate",
-        "mode", "auto_dictation", "record_mute_system",
+        "mode", "voice_loop", "speak_notifications", "record_mute_system",
         "claude_model", "record_silence_seconds",
     ]
     print(json.dumps({k: cfg.get(k) for k in visible_keys}, indent=2))
@@ -80,7 +80,6 @@ def usage() -> None:
         f"(default: {'on' if d['log_verbose'] else 'off'})\n"
         "  install [--force]         — pre-download all models/deps (runs automatically\n"
         "                              on first session; --force re-runs)\n"
-        "  uninstall [--wipe-logs]   — delete venv, models, config; requires --force\n"
         "  progress [--follow]       — show install log lines (snapshot or live stream)\n"
         "  status                    — show current config + tooling availability\n"
         "\n"
@@ -185,8 +184,22 @@ def main(argv: list[str]) -> int:
     elif cmd == "off":
         cfg["enabled"] = False
     elif cmd == "stop":
-        for p in ("afplay", "ffplay"):
-            subprocess.run(["pkill", "-f", p], check=False)
+        # 1. Tell the daemon to kill any in-flight playback/recording.
+        #    Uses its kill op (SIGTERMs ffplay via PID_FILE, sets
+        #    RECORD_CANCEL to abort recording) — scoped to OUR processes.
+        try:
+            from claude_speak.daemon import _socket_alive, send_request
+            if _socket_alive():
+                send_request({"op": "kill"}, timeout=2)
+        except Exception:
+            pass
+        # 2. Write a one-shot marker so speak.py silences the VERY NEXT
+        #    Stop hook firing. Without this, Claude's reply to /speak stop
+        #    immediately triggers a new turn and we'd speak 'stopped' back.
+        try:
+            (DATA_DIR / ".skip_next_turn").touch()
+        except OSError:
+            pass
         print("stopped")
         return 0
     elif cmd == "voice" and rest:
@@ -216,7 +229,13 @@ def main(argv: list[str]) -> int:
         # drop legacy key if present so the two don't disagree
         cfg.pop("pipeline_sentences", None)
     elif cmd == "dictate" and rest and rest[0] in ("on", "off"):
-        cfg["auto_dictation"] = rest[0] == "on"
+        # Renamed to voice_loop; set both for back-compat while older code
+        # (or running daemon) is still around.
+        on = rest[0] == "on"
+        cfg["voice_loop"] = on
+        cfg["auto_dictation"] = on
+    elif cmd == "notifications" and rest and rest[0] in ("on", "off"):
+        cfg["speak_notifications"] = rest[0] == "on"
     elif cmd == "mute" and rest and rest[0] in ("on", "off"):
         cfg["record_mute_system"] = rest[0] == "on"
     elif cmd == "model" and rest:
@@ -271,20 +290,6 @@ def main(argv: list[str]) -> int:
             _follow_install_log()
             return 0
         ok = install_all(cfg=merged(), quiet=False)
-        return 0 if ok else 1
-    elif cmd == "uninstall":
-        from claude_speak.install import uninstall_all
-        from claude_speak.config import DATA_DIR as _DD
-        if "--force" not in rest:
-            print(f"This will wipe {_DD}")
-            print("  - .venv/ (plugin-private Python env, ~1GB)")
-            print("  - kokoro/ and models/ (downloaded TTS and STT models)")
-            print("  - config.json, markers, lockfile")
-            print()
-            print("Pass --force to confirm (add --wipe-logs to also delete speak.log).")
-            return 1
-        wipe_logs = "--wipe-logs" in rest
-        ok = uninstall_all(keep_log=not wipe_logs, quiet=False)
         return 0 if ok else 1
     elif cmd == "progress":
         follow = "--follow" in rest

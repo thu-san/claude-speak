@@ -87,6 +87,7 @@ After that, everything runs fully offline.
 | `/speak silence <0.3-10>` | Silence seconds before recording stops |
 | `/speak mode stream \| whole` | `stream`: play sentence-by-sentence (fast first audio). `whole`: one big synthesis then play (smoother prosody, slower start) |
 | `/speak dictate on \| off` | Enable the hands-free voice loop |
+| `/speak notifications on \| off` | Speak Claude Code notifications (permission prompts, idle, etc.) aloud |
 | `/speak status` | Show config + tooling availability |
 | `/claude-speak:daemon-status` | Show daemon uptime / pid / in-flight |
 | `/claude-speak:daemon-restart` | Restart the daemon (pick up code changes) |
@@ -125,9 +126,47 @@ Relevant fields:
 
 Override `CLAUDE_SPEAK=0` in the environment to mute for a single session.
 
+## Terminal CLI: source the auto-generated `.env`
+
+Claude Code sets `CLAUDE_PLUGIN_DATA` automatically for hooks (Stop / Notification / SessionStart) and slash commands (our templates inject it). **Raw-terminal invocations** (`python3 -m claude_speak.stt`, `… .rewrite`, `… turn`, `speak_config.py`) don't get that for free — they'll raise a clear error if the env var is missing.
+
+The SessionStart hook writes the right value into `<plugin_root>/.env` on every install / session start, so all you need to do is source it in your shell:
+
+```bash
+# once per terminal session, from the plugin checkout
+set -a; source .env; set +a
+python3 -m claude_speak.stt
+# ... any other terminal CLI now works
+```
+
+`.env` contains one line: `CLAUDE_PLUGIN_DATA=/Users/you/.claude/plugins/data/claude-speak-<marketplace>`. It's auto-regenerated every SessionStart, so switching between installs (`@thu-san` ↔ `@local`) keeps it in sync — no manual edits.
+
+**Alternatives** if sourcing manually feels clunky:
+
+- **VSCode integrated terminal** inherits the right env if you add this to `.vscode/settings.json` (note the hardcoded path, so you lose the auto-refresh — update if you switch installs):
+  ```jsonc
+  {
+    "terminal.integrated.env.osx": {
+      "CLAUDE_PLUGIN_DATA": "/Users/you/.claude/plugins/data/claude-speak-local"
+    }
+  }
+  ```
+
+- **direnv** users: drop `dotenv` in a `.envrc`, run `direnv allow` once, and every `cd` into the checkout auto-loads `.env`.
+
+Gitignored. Never committed. Python never reads `.env` itself — the shell has to load it.
+
 ## Testing individual modules from the CLI
 
-Each backend is its own module and can run standalone. Useful for benchmarking inference speed or debugging.
+Each backend — rewrite, TTS, STT, daemon — is its own module and can run standalone. Pipeline from Stop hook:
+
+```
+raw Claude reply → rewrite (claude -p) → TTS (Kokoro) → ffplay → record (Silero VAD) → STT (whisper.cpp) → decision:block
+   └─ debug with ─┘   └──── debug with ────┘                     └─────────── debug with ────────────────┘
+    rewrite CLI       tts.kokoro CLI                              stt CLI
+```
+
+Invoke any layer in isolation to identify where time goes or what's broken without the full hook flow.
 
 ```bash
 # path to the checkout; adjust if installed elsewhere
@@ -148,9 +187,11 @@ python3 -m claude_speak.tts.kokoro --file fixtures/input.txt --whole       # sin
 python3 -m claude_speak.tts.kokoro --list-voices
 echo "Pipe this in." | python3 -m claude_speak.tts.kokoro
 
-# Rewrite via claude -p
+# Rewrite via claude -p (bypasses the daemon — useful for debugging timeouts).
+# fixtures/rewrite_input.txt is a 1.8KB realistic reply for reproducible tests.
+python3 -m claude_speak.rewrite --file fixtures/rewrite_input.txt
+python3 -m claude_speak.rewrite --file fixtures/rewrite_input.txt --model sonnet --timeout 120
 python3 -m claude_speak.rewrite --text "Raw assistant response..."
-python3 -m claude_speak.rewrite --model sonnet --file response.md
 
 # Record AND transcribe in one shot.
 # Routes through the warm daemon by default; --no-daemon to bypass.
@@ -164,6 +205,32 @@ python3 -m claude_speak.stt --no-daemon
 python3 -m claude_speak.stt ~/.claude/plugins/data/claude-speak-thu-san/input.wav
 python3 -m claude_speak.stt ~/.claude/plugins/data/claude-speak-thu-san/input.wav \
     --model ggml-tiny.en.bin --threads 8
+
+# End-to-end: run the FULL Stop-hook pipeline against canned input.
+# rewrite → TTS → speak → listen → STT → prints the transcribed reply.
+# This is what fires when Claude finishes a turn — just sourced from a
+# file / --text instead of a live transcript. Each phase is timed in
+# speak.log so you can see exactly where seconds go.
+python3 -m claude_speak turn --file fixtures/rewrite_input.txt
+python3 -m claude_speak turn --text "Done — all 37 tests passing on ARM."
+python3 -m claude_speak turn --file fixtures/rewrite_input.txt --no-daemon
+
+# Notification hook: pipe a canned Claude Code Notification payload
+# through the shim — closest to what fires on a real permission prompt.
+echo '{"session_id":"x","hook_event_name":"Notification","message":"Claude needs your permission to use Bash","title":"Permission needed","notification_type":"permission_prompt"}' \
+  | python3 announce.py
+
+# Same thing via the daemon directly (skip the shim + stdin parsing).
+# rewrite=False + voice_loop=False = speak verbatim, no mic recording after.
+python3 -c "
+from claude_speak.daemon import send_request
+print(send_request({
+    'op': 'turn',
+    'text': 'Heads up — the build finished.',
+    'rewrite': False,
+    'voice_loop': False,
+}))
+"
 
 # Daemon control + persistent whisper-model switch
 python3 -m claude_speak.stt --restart-daemon
@@ -187,7 +254,9 @@ Slash command equivalents: `/claude-speak:whisper-tiny` · `whisper-base` · `wh
 
 ## Fixtures
 
-`scripts/fixtures/input.txt` — ~1500 characters, 17 sentences, intentionally varied (decimals, semicolons, short/long sentences). Use it as a benchmarking input for the Kokoro CLI:
+Two test inputs ship under `scripts/fixtures/`:
+
+**`input.txt`** — ~1500 characters, 17 sentences, intentionally varied (decimals, semicolons, short/long sentences). Use it as a benchmarking input for the Kokoro CLI:
 
 ```bash
 cd scripts
@@ -195,6 +264,18 @@ python3 -m claude_speak.tts.kokoro --file fixtures/input.txt --no-play
 ```
 
 Default mode is overlapped per-sentence (sentence N+1 renders while sentence N plays). `--no-play` disables the player so you get clean synthesis timings. Use `--whole` to disable per-sentence and synthesize everything in one call.
+
+**`rewrite_input.txt`** — ~1.8KB realistic assistant reply (prose + a Go code block + a numbered list + inline backticks + a trailing question). Use it to exercise the rewrite path — handy when you're debugging `claude -p` timeouts or comparing rewrite prompts:
+
+```bash
+cd scripts
+python3 -m claude_speak.rewrite --file fixtures/rewrite_input.txt
+time python3 -m claude_speak.rewrite --file fixtures/rewrite_input.txt --model sonnet
+
+# full rewrite → TTS chain on a known input
+python3 -m claude_speak.rewrite --file fixtures/rewrite_input.txt \
+  | python3 -m claude_speak.tts.kokoro
+```
 
 ## Tests
 
@@ -243,6 +324,26 @@ Every module has a single responsibility and a narrow public API. Adding a new T
 5. A player thread pulls audio in order and plays via `ffplay` stdin streaming.
 6. If `auto_dictation: true`: the hook waits for playback to end, records via sounddevice with silence detection, transcribes with whisper.cpp, and emits `{"decision":"block","reason":"..."}` so Claude Code treats the transcript as the next user prompt.
 
+## Latency budget
+
+Rough per-reply wall-clock on Intel i9 CPU, start of Stop hook → first audio:
+
+| Phase | Typical | Why |
+|---|---:|---|
+| Hook → daemon dispatch | <50ms | warm daemon, unix socket |
+| `claude -p` startup | **3–5s** | **Node.js startup + plugin sync + keychain reads + TLS + API round trip — CLI overhead, not model inference.** Unavoidable without an API key. |
+| Rewrite model inference | 1–2s | actual Sonnet response |
+| Kokoro first-sentence synth | 1–2s | ONNX on CPU, fp32 |
+| ffplay start | <200ms | |
+| **→ first audio at** | **~5–9s** | |
+
+The floor is `claude -p` overhead. If you're willing to set `ANTHROPIC_API_KEY` and hit `/v1/messages` directly, it drops to ~1s — but we keep the default path on subscription auth so users don't have to manage API keys. Document choice: simplicity > speed.
+
+Knobs that actually help on the current path:
+- `--setting-sources local` is already passed → skips hooks and MCPs from user/project settings (was the biggest unpredictable stall).
+- `mode: stream` (default) → you hear sentence 1 while sentence 2+N synthesize in parallel. Don't switch to `whole` unless you're benchmarking.
+- Apple Silicon cuts Kokoro + whisper times 3–5×. See [Future upgrade paths](#future-upgrade-paths-apple-silicon).
+
 ## Daemon
 
 A long-running Unix-socket daemon (`claude_speak.daemon`) keeps Python + Silero VAD + Kokoro + whisper.cpp models warm in memory across turns. Without it, every Stop hook spawns a fresh Python process and reloads everything from scratch (~10-15s of pure cold-start before the mic even opens).
@@ -251,6 +352,16 @@ A long-running Unix-socket daemon (`claude_speak.daemon`) keeps Python + Silero 
 - Both the Stop hook (`scripts/speak.py`) and the standalone CLI (`python -m claude_speak.stt`) route through it via `stt.dictate(cfg)` — that's the single public entry point; routing is internal.
 - Pass `--no-daemon` to the CLI, or set `daemon: false` in config, to bypass.
 - `/claude-speak:daemon-status` / `daemon-restart` / `daemon-stop` to manage it.
+
+## Notifications
+
+Claude Code fires a `Notification` hook whenever the UI needs your attention — permission prompts ("Claude needs your permission to use Bash"), MCP elicitation dialogs, idle-waiting reminders, auth-success. claude-speak speaks those aloud so you can work with headphones on and still know when the turn is blocked on your click. The plugin doesn't (and can't) auto-approve — the decision still happens in the UI; it just tells you it's there.
+
+- **How it works**: `scripts/announce.py` receives the hook JSON, routes to the daemon's `turn` op with `text=<message> rewrite=False voice_loop=False`. Spoken verbatim (no 3-5s `claude -p` floor) and speak-only (no mic recording afterward).
+- **Toggle**: `/speak notifications on|off` (global). Per-type toggles live under `speak_notification_types` in config — `permission_prompt` / `elicitation_dialog` / `idle_prompt` are on by default, `auth_success` is off.
+- **Interrupts the current turn**: if a notification arrives while Claude's reply is still being spoken, the reply gets cut so the notification is heard immediately. Permission prompts are higher priority.
+
+See the **[Testing individual modules from the CLI](#testing-individual-modules-from-the-cli)** section above for commands that exercise the notification path end-to-end without waiting for a real Claude Code prompt.
 
 ## Future upgrade paths (Apple Silicon)
 
@@ -283,7 +394,8 @@ For now (Intel CPU): Kokoro is the right call and trying any of the above hurts 
 ## Known limitations
 
 - **`/plugin uninstall claude-speak` doesn't kill the running daemon.** Claude Code wipes the plugin data dir (venv, models, sockets) but the daemon process keeps running with stale fds, holding ~500MB until you reboot. Harmless (no future session can reach it) but wasteful — run `/claude-speak:daemon-stop` *before* uninstalling if you care.
-- **Single shared daemon serializes requests across all Claude Code windows.** If three windows finish replies at the same instant, two block waiting for the first. Acceptable for typical use; if it bites, set `daemon: false` in config and pay the per-turn cold start.
+- **Shared daemon per install serializes requests across Claude Code windows using the same install.** If three windows on the same install finish replies at the same instant, two block waiting for the first. Acceptable for typical use; if it bites, set `daemon: false` in config and pay the per-turn cold start. (Different installs — e.g. `@thu-san` vs `@claude-speak-local` — each have their own daemon; they don't serialize against each other.)
+- **Audio hardware is shared between installs.** Data dirs, daemons, venvs, and sockets are fully isolated between `@thu-san` and `@claude-speak-local` (or any two installs), but the speaker + mic are one physical thing. Running both simultaneously with `voice_loop: true` on both can step on each other: overlapping TTS, one's `_SystemMute` cutting off the other's speech, or both mics capturing the same audio. Mitigation: run `/speak dictate off` on the one you're not actively using — TTS-only overlap is less disruptive than dictation collision.
 - **Daemon auto-restarts on plugin code changes** — it watches mtimes of its own `.py` files every 30s and self-shuts when one moves forward, so you don't have to remember `/claude-speak:daemon-restart` after pulling.
 - **`speak.log` rotates daily** to `speak.log.YYYY-MM-DD`. Older days stay on disk — delete what you don't need.
 

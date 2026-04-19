@@ -9,8 +9,33 @@ import os
 import subprocess
 from typing import Iterator
 
+from .config import DATA_DIR
 from .logging import log
 from .transcript import REWRITE_SYSTEM
+
+
+def _neutral_cwd() -> str:
+    """An empty directory with no .claude/settings*.json inside.
+
+    Combined with `--setting-sources local`, this makes claude-cli load ZERO
+    hooks/MCPs — neither the user's ~/.claude/settings.json nor any project
+    .claude/settings.json. Subscription auth still works because credentials
+    live in ~/.claude/.credentials.json and aren't controlled by
+    --setting-sources.
+
+    Security: the whole premise hinges on this directory staying empty of
+    settings files. If another local user could drop a .claude dir inside,
+    their hooks would fire inside our claude -p subprocess."""
+    path = DATA_DIR / "rewrite_sandbox"
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # mkdir(mode=) is a no-op when the dir already exists, so chmod after.
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+    if path.is_symlink():
+        raise RuntimeError(f"rewrite_sandbox is a symlink ({path}); refusing to run")
+    return str(path)
 
 
 def rewrite(text: str, cfg: dict) -> str:
@@ -29,25 +54,50 @@ def rewrite(text: str, cfg: dict) -> str:
     timeout = int(cfg.get("claude_rewrite_timeout", 60))
     model = cfg.get("claude_model")
     env = {**os.environ, "CLAUDE_SPEAK": "0"}
-    args = [cli, "-p", prompt]
+    # Pass the prompt on stdin rather than as an argv string:
+    # (1) argv is size-limited on some platforms and very large prompts truncate
+    #     silently; stdin has no such cap.
+    # (2) some claude-cli versions treat `claude -p` with a tty-attached stdin
+    #     as interactive and block waiting for input. Forcing stdin to the
+    #     prompt sidesteps both.
+    # --setting-sources local + run from an empty cwd → skip every hook and
+    # MCP server defined in the user's ~/.claude/settings.json or any project
+    # .claude/settings*.json. Without this, a slow/hung hook in the caller's
+    # env times the rewrite out with no visible error.
+    args = [cli, "-p", "--setting-sources", "local"]
     if model:
         args += ["--model", model]
+    sandbox = _neutral_cwd()
+    log(f"rewrite → cli={cli} model={model} prompt_chars={len(prompt)} timeout={timeout}s cwd={sandbox}")
+    # Log a preview of the END of the prompt — that's where the actual
+    # assistant text lives; the head is our (constant, boring) system prompt.
+    log(f"rewrite in tail: ...{text[-400:]!r}")
     try:
         result = subprocess.run(
             args,
+            input=prompt,
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
             env=env,
+            cwd=sandbox,
         )
-    except subprocess.TimeoutExpired:
-        log(f"claude rewrite timed out after {timeout}s")
+    except subprocess.TimeoutExpired as e:
+        # Surface whatever partial stderr was captured before the timeout —
+        # that usually names the real cause (auth prompt, MCP server hung,
+        # rate limit, etc.).
+        partial_stderr = (e.stderr or b"")
+        if isinstance(partial_stderr, bytes):
+            partial_stderr = partial_stderr.decode("utf-8", errors="replace")
+        log(f"claude rewrite timed out after {timeout}s stderr={partial_stderr.strip()[:400]!r}")
         return ""
     if result.returncode != 0:
-        log(f"claude rewrite exit={result.returncode} stderr={result.stderr[:200]!r}")
+        log(f"claude rewrite exit={result.returncode} stderr={result.stderr.strip()[:400]!r}")
         return ""
-    return result.stdout.strip()
+    out = result.stdout.strip()
+    log(f"rewrite out: {len(out)}c head={out[:200]!r}")
+    return out
 
 
 def rewrite_stream(text: str, cfg: dict) -> Iterator[str]:

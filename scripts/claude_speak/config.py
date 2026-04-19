@@ -6,26 +6,34 @@ import os
 from pathlib import Path
 
 
-def data_dir() -> Path:
-    """Resolve the plugin's persistent data dir.
+PLUGIN_NAME = "claude-speak"
 
-    Order of preference:
-      1. CLAUDE_PLUGIN_DATA — set by Claude Code for hook subprocesses.
-      2. Any existing ~/.claude/plugins/data/claude-speak-* directory (matches
-         whatever marketplace the plugin was installed from).
-      3. Pin to the canonical path for the published marketplace so terminal
-         invocations land in the SAME place the hook will use.
-    """
+
+def data_dir() -> Path:
+    """Resolve the plugin's persistent data dir from CLAUDE_PLUGIN_DATA.
+
+    Claude Code sets this env var for every in-app invocation:
+      * Hooks (Stop, Notification, SessionStart) — set directly.
+      * Slash commands — our command templates prepend
+        `CLAUDE_PLUGIN_DATA=${CLAUDE_PLUGIN_DATA}` before invoking python,
+        which Claude Code substitutes at template time so the env var
+        reaches the subprocess.
+
+    For raw-terminal debugging (`python3 -m claude_speak.stt` etc.) the
+    user must export CLAUDE_PLUGIN_DATA themselves — e.g. in ~/.zshrc or
+    VSCode settings. See README 'Developing against a local marketplace'.
+    No canonical fallback: guessing silently lands data in the wrong
+    install. Better to raise and make the caller fix their invocation."""
     d = os.environ.get("CLAUDE_PLUGIN_DATA")
     if d:
         return Path(d)
-    base = Path.home() / ".claude" / "plugins" / "data"
-    if base.is_dir():
-        for entry in sorted(base.iterdir()):
-            if entry.is_dir() and entry.name.startswith("claude-speak"):
-                return entry
-    # Canonical path used by `/plugin install claude-speak@thu-san`.
-    return base / "claude-speak-thu-san"
+    raise RuntimeError(
+        "CLAUDE_PLUGIN_DATA is not set.\n"
+        "  * Hooks + slash commands: Claude Code sets this automatically; "
+        "if you see this error from one of those, reinstall the plugin.\n"
+        "  * Terminal: export CLAUDE_PLUGIN_DATA=~/.claude/plugins/data/"
+        "claude-speak-<marketplace> before running. See README."
+    )
 
 
 DATA_DIR = data_dir()

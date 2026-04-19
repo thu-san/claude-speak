@@ -1,6 +1,6 @@
 {
   "name": "claude-speak",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Speak Claude Code responses aloud with 100% local stack: Kokoro TTS + claude CLI rewrite + whisper.cpp STT. Hands-free voice loop via auto-dictation. No paid API keys required.",
   "author": {
     "name": "thu-san"
