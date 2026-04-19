@@ -106,25 +106,12 @@ def send_request(req: dict, timeout: float = 600.0) -> dict | None:
             pass
 
 
-def ensure_daemon() -> bool:
-    """If the daemon isn't running, fork a detached child to start it.
-    Returns True if the daemon is alive AND responsive after this call.
-
-    Healthcheck: a wedged daemon may still hold the socket — we send a
-    status RPC with a tight timeout to confirm the request loop is alive.
-    If it isn't, kill the held pid (if known) and respawn."""
-    if _socket_alive():
-        if _daemon_responsive():
-            return True
-        log("daemon socket alive but unresponsive — killing and respawning")
-        _kill_held_daemon()
-    log("starting daemon (background)…")
-    # Spawn `python -m claude_speak.daemon serve --background`
+def _spawn_daemon() -> None:
+    """Fork + detach + exec the daemon. Parent returns immediately."""
     from .venv import VENV_PYTHON, venv_ready
     py = str(VENV_PYTHON) if venv_ready() else sys.executable
     pid = os.fork()
     if pid == 0:
-        # Child: detach and exec.
         os.setsid()
         if os.fork() > 0:
             os._exit(0)
@@ -135,16 +122,53 @@ def ensure_daemon() -> bool:
             except OSError:
                 pass
         os.execv(py, [py, "-m", "claude_speak.daemon", "serve"])
-    # Parent: wait for the socket to come up. Cold-start preload of Silero
-    # + Kokoro can take 20-35s on Intel CPU; 60s gives enough headroom
-    # without forcing a fallback on every fresh daemon spawn.
-    wait_s = 60
-    deadline = time.monotonic() + wait_s
+
+
+def _wait_for_socket(timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if _socket_alive():
             return True
         time.sleep(0.1)
-    log(f"daemon failed to start within {wait_s}s")
+    return False
+
+
+def ensure_daemon() -> bool:
+    """If the daemon isn't running, fork a detached child to start it.
+    Returns True if the daemon is alive AND responsive after this call.
+
+    Two recovery paths for wedged state:
+      * Socket alive but unresponsive → status RPC times out → kill holder,
+        respawn.
+      * No socket AND spawn timed out → a prior crashed daemon left a stale
+        start.lock (with a still-live pid that's stuck in preload / import /
+        etc.). The fresh spawn's _acquire_start_lock sees 'another daemon
+        running' and silently exits without binding. Detect this by timeout,
+        wipe the holder, retry ONCE. Without this, every subsequent hook
+        call times out the same way until the user manually intervenes.
+    """
+    if _socket_alive():
+        if _daemon_responsive():
+            return True
+        log("daemon socket alive but unresponsive — killing and respawning")
+        _kill_held_daemon()
+    log("starting daemon (background)…")
+    # Cold-start preload of Silero + Kokoro can take 20-35s on Intel CPU;
+    # 60s gives enough headroom without forcing a fallback on every spawn.
+    wait_s = 60
+    _spawn_daemon()
+    if _wait_for_socket(wait_s):
+        return True
+    # Spawn timed out. Usually means a stale/wedged predecessor is holding
+    # the start.lock — our child saw the held lock, bailed silently. Wipe
+    # and retry once.
+    log(f"daemon failed to start within {wait_s}s — attempting recovery")
+    _kill_held_daemon()
+    _spawn_daemon()
+    if _wait_for_socket(wait_s):
+        log("daemon recovered after second spawn")
+        return True
+    log(f"daemon still down after recovery attempt; falling back to in-process")
     return False
 
 
