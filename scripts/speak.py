@@ -42,6 +42,19 @@ def main() -> int:
     if os.environ.get("CLAUDE_SPEAK") == "0":
         return 0
 
+    # One-shot skip marker: /speak stop writes DATA_DIR/.skip_next_turn to
+    # suppress the NEXT Stop hook. Without this, running /speak stop kills
+    # in-flight playback but the turn's own reply immediately refires the
+    # Stop hook and we speak again. Marker is consumed on first sight.
+    from claude_speak.config import DATA_DIR
+    skip_marker = DATA_DIR / ".skip_next_turn"
+    if skip_marker.exists():
+        try:
+            skip_marker.unlink()
+        except FileNotFoundError:
+            pass
+        return 0
+
     raw = sys.stdin.read()
     try:
         payload = json.loads(raw or "{}")

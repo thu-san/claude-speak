@@ -185,8 +185,22 @@ def main(argv: list[str]) -> int:
     elif cmd == "off":
         cfg["enabled"] = False
     elif cmd == "stop":
-        for p in ("afplay", "ffplay"):
-            subprocess.run(["pkill", "-f", p], check=False)
+        # 1. Tell the daemon to kill any in-flight playback/recording.
+        #    Uses its kill op (SIGTERMs ffplay via PID_FILE, sets
+        #    RECORD_CANCEL to abort recording) — scoped to OUR processes.
+        try:
+            from claude_speak.daemon import _socket_alive, send_request
+            if _socket_alive():
+                send_request({"op": "kill"}, timeout=2)
+        except Exception:
+            pass
+        # 2. Write a one-shot marker so speak.py silences the VERY NEXT
+        #    Stop hook firing. Without this, Claude's reply to /speak stop
+        #    immediately triggers a new turn and we'd speak 'stopped' back.
+        try:
+            (DATA_DIR / ".skip_next_turn").touch()
+        except OSError:
+            pass
         print("stopped")
         return 0
     elif cmd == "voice" and rest:
