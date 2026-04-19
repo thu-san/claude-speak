@@ -126,6 +126,25 @@ Relevant fields:
 
 Override `CLAUDE_SPEAK=0` in the environment to mute for a single session.
 
+## Developing against a local marketplace
+
+If you've installed claude-speak from a **local checkout** (e.g. `/plugin marketplace add /path/to/claude-speak`) instead of from GitHub (`thu-san/claude-speak`), your install's data dir is `~/.claude/plugins/data/claude-speak-<your-marketplace-name>/` — not the production default `claude-speak-thu-san/`.
+
+Claude Code sets `CLAUDE_PLUGIN_DATA` correctly for hook invocations, so the Stop / Notification / SessionStart flow always finds the right dir. But **terminal commands** (`python3 -m claude_speak.stt`, `… .rewrite`, `… turn`, etc.) have no hook context and default to `claude-speak-thu-san`. Set the env var in your shell rc so terminal commands follow your local install:
+
+```bash
+# ~/.zshrc (or ~/.bashrc)
+export CLAUDE_PLUGIN_DATA=~/.claude/plugins/data/claude-speak-<your-marketplace-name>
+```
+
+Example — if your marketplace is named `claude-speak-local`:
+
+```bash
+export CLAUDE_PLUGIN_DATA=~/.claude/plugins/data/claude-speak-claude-speak-local
+```
+
+Production users (`claude-speak@thu-san` from GitHub) never need to set this — they get the canonical dir automatically.
+
 ## Testing individual modules from the CLI
 
 Each backend — rewrite, TTS, STT, daemon — is its own module and can run standalone. Pipeline from Stop hook:
