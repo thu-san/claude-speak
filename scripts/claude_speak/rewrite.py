@@ -32,6 +32,10 @@ def rewrite(text: str, cfg: dict) -> str:
     args = [cli, "-p", prompt]
     if model:
         args += ["--model", model]
+    log(f"rewrite → cli={cli} model={model} prompt_chars={len(prompt)} timeout={timeout}s")
+    # Log a preview of the END of the prompt — that's where the actual
+    # assistant text lives; the head is our (constant, boring) system prompt.
+    log(f"rewrite in tail: ...{text[-400:]!r}")
     try:
         result = subprocess.run(
             args,
@@ -41,13 +45,21 @@ def rewrite(text: str, cfg: dict) -> str:
             check=False,
             env=env,
         )
-    except subprocess.TimeoutExpired:
-        log(f"claude rewrite timed out after {timeout}s")
+    except subprocess.TimeoutExpired as e:
+        # Surface whatever partial stderr was captured before the timeout —
+        # that usually names the real cause (auth prompt, MCP server hung,
+        # rate limit, etc.).
+        partial_stderr = (e.stderr or b"")
+        if isinstance(partial_stderr, bytes):
+            partial_stderr = partial_stderr.decode("utf-8", errors="replace")
+        log(f"claude rewrite timed out after {timeout}s stderr={partial_stderr.strip()[:400]!r}")
         return ""
     if result.returncode != 0:
-        log(f"claude rewrite exit={result.returncode} stderr={result.stderr[:200]!r}")
+        log(f"claude rewrite exit={result.returncode} stderr={result.stderr.strip()[:400]!r}")
         return ""
-    return result.stdout.strip()
+    out = result.stdout.strip()
+    log(f"rewrite out: {len(out)}c head={out[:200]!r}")
+    return out
 
 
 def rewrite_stream(text: str, cfg: dict) -> Iterator[str]:
