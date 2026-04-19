@@ -127,13 +127,16 @@ def ensure_daemon() -> bool:
             except OSError:
                 pass
         os.execv(py, [py, "-m", "claude_speak.daemon", "serve"])
-    # Parent: wait briefly for the socket to come up.
-    deadline = time.monotonic() + 30
+    # Parent: wait for the socket to come up. Cold-start preload of Silero
+    # + Kokoro can take 20-35s on Intel CPU; 60s gives enough headroom
+    # without forcing a fallback on every fresh daemon spawn.
+    wait_s = 60
+    deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
         if _socket_alive():
             return True
         time.sleep(0.1)
-    log("daemon failed to start within 30s")
+    log(f"daemon failed to start within {wait_s}s")
     return False
 
 
