@@ -6,32 +6,35 @@ import os
 from pathlib import Path
 
 
-CANONICAL_DIR_NAME = "claude-speak-thu-san"
 PLUGIN_NAME = "claude-speak"
 
 
 def data_dir() -> Path:
-    """Resolve the plugin's persistent data dir.
+    """Resolve the plugin's persistent data dir from CLAUDE_PLUGIN_DATA.
 
-    Order of preference:
-      1. CLAUDE_PLUGIN_DATA — env var set by Claude Code for hook
-         subprocesses. Always wins. Works for 99% of users: both production
-         (single @thu-san install) and dev (single @claude-speak-local
-         install) flow through the Stop / SessionStart / Notification hooks,
-         and Claude Code sets this env var to the right path every time.
-      2. Fall back to the canonical dir `claude-speak-thu-san` (the path
-         users of the published plugin get on a clean install).
+    Claude Code sets this env var for every context where the plugin
+    actually runs:
+      * Hooks (Stop, Notification, SessionStart) — set directly.
+      * Slash commands — our command templates prepend
+        `CLAUDE_PLUGIN_DATA=${CLAUDE_PLUGIN_DATA}` before invoking python,
+        which Claude Code substitutes at template time so the env var
+        reaches the subprocess.
+      * Raw terminal — set it yourself: `export CLAUDE_PLUGIN_DATA=~/.claude/plugins/data/claude-speak-<marketplace>`.
 
-    Users running terminal commands against a NON-canonical install (e.g.
-    a dev machine with @claude-speak-local alongside production @thu-san)
-    should export CLAUDE_PLUGIN_DATA in their shell rc pointing at the
-    dev dir. See README "Developing against a local marketplace" for
-    details.
-    """
+    No canonical fallback — guessing the marketplace name when the env var
+    is missing silently lands data in the wrong install (burn-scar from
+    earlier). Better to raise and make the caller fix their invocation."""
     d = os.environ.get("CLAUDE_PLUGIN_DATA")
     if d:
         return Path(d)
-    return Path.home() / ".claude" / "plugins" / "data" / CANONICAL_DIR_NAME
+    raise RuntimeError(
+        "CLAUDE_PLUGIN_DATA is not set.\n"
+        "  * Hooks + slash commands: Claude Code sets this automatically; "
+        "if you see this error from one of those, reinstall the plugin and "
+        "file a bug.\n"
+        "  * Terminal: export CLAUDE_PLUGIN_DATA=~/.claude/plugins/data/"
+        "claude-speak-<marketplace> before running the command."
+    )
 
 
 DATA_DIR = data_dir()
