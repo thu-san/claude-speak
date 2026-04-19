@@ -1,0 +1,24 @@
+# Pinned requirements for the plugin's private venv. install.py installs
+# these into $CLAUDE_PLUGIN_DATA/.venv, not the user's system Python.
+
+# Mic capture
+sounddevice>=0.4,<1
+# numpy pinned to <2 because torch 2.3+ (which supports numpy 2) isn't
+# available for Intel macOS — pip resolves to torch 2.2.2 there, which
+# was built against numpy 1.x and errors at runtime with numpy 2.
+numpy>=1.23,<2
+
+# VAD (pulls torch + onnxruntime transitively)
+silero-vad>=5,<6
+
+# TTS — kokoro-onnx itself is installed separately with --no-deps because
+# its metadata says numpy>=2, which conflicts with our pin even though
+# the actual runtime works fine with numpy 1.26 (verified locally).
+# We pre-install its runtime deps here so --no-deps doesn't strand us.
+onnxruntime>=1.17,<2
+espeakng-loader>=0.2.4
+phonemizer-fork>=3.3.2
+colorlog>=6.9
+
+# Model integrity check in install.py
+onnx>=1.14,<2

@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# personal scratch files
+dummy_*.log
+
+# local debug artifacts
+*.wav.partial
+*.bin.partial
+*.onnx.partial
+
+# project-local Claude Code settings (contains personal home paths, MCP refs, etc.)
+.claude/
+
+# macOS
+.DS_Store

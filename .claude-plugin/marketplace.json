@@ -1,0 +1,13 @@
+{
+  "name": "thu-san",
+  "owner": {
+    "name": "thu-san"
+  },
+  "plugins": [
+    {
+      "name": "claude-speak",
+      "source": "./",
+      "description": "Speak Claude Code responses aloud with 100% local stack: Kokoro TTS + claude CLI rewrite + whisper.cpp STT. Hands-free voice loop via auto-dictation. No paid API keys required."
+    }
+  ]
+}
