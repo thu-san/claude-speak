@@ -148,9 +148,11 @@ python3 -m claude_speak.tts.kokoro --file fixtures/input.txt --whole       # sin
 python3 -m claude_speak.tts.kokoro --list-voices
 echo "Pipe this in." | python3 -m claude_speak.tts.kokoro
 
-# Rewrite via claude -p
+# Rewrite via claude -p (bypasses the daemon — useful for debugging timeouts).
+# fixtures/rewrite_input.txt is a 1.8KB realistic reply for reproducible tests.
+python3 -m claude_speak.rewrite --file fixtures/rewrite_input.txt
+python3 -m claude_speak.rewrite --file fixtures/rewrite_input.txt --model sonnet --timeout 120
 python3 -m claude_speak.rewrite --text "Raw assistant response..."
-python3 -m claude_speak.rewrite --model sonnet --file response.md
 
 # Record AND transcribe in one shot.
 # Routes through the warm daemon by default; --no-daemon to bypass.
