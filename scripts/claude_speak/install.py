@@ -502,33 +502,56 @@ def main() -> int:
                     help="double-fork and detach immediately, then run the install "
                     "in the background. Used by the SessionStart hook.")
     ap.add_argument("--uninstall", action="store_true",
-                    help="remove the venv, downloaded models, and all plugin data "
-                    "for EVERY claude-speak install found under "
-                    "~/.claude/plugins/data/")
+                    help="remove the venv, downloaded models, and plugin data. "
+                    "Defaults to the single install if there's exactly one; "
+                    "requires --target or --all when multiple side-by-side "
+                    "installs exist, to avoid accidentally wiping the wrong one.")
     ap.add_argument("--wipe-logs", action="store_true",
                     help="with --uninstall, also delete speak.log")
     ap.add_argument("--target", metavar="MARKETPLACE",
                     help="with --uninstall, wipe only the install for this "
-                    "marketplace (e.g. 'thu-san' or 'claude-speak-local') "
-                    "instead of all. Useful when you want to keep other "
-                    "side-by-side installs intact.")
+                    "marketplace (e.g. 'thu-san' or 'claude-speak-local'). "
+                    "Leaves other side-by-side installs intact.")
+    ap.add_argument("--all", action="store_true",
+                    help="with --uninstall, wipe EVERY claude-speak install "
+                    "found under ~/.claude/plugins/data/. Required when "
+                    "multiple installs exist and no --target is given.")
     args = ap.parse_args()
 
     if args.uninstall:
-        installs = _find_install_dirs()
+        all_installs = _find_install_dirs()
+        if not all_installs:
+            print("no claude-speak installs found under ~/.claude/plugins/data/")
+            return 0
+
+        # Choose which install(s) to wipe. Three cases:
+        #   --target X       → just that one
+        #   --all            → every found install
+        #   (neither, one install found) → the single one (unambiguous)
+        #   (neither, 2+ found) → refuse; tell user to pick
         if args.target:
-            # Surgical: only the named marketplace.
             target_dir = (Path.home() / ".claude" / "plugins" / "data"
                           / f"claude-speak-{args.target}")
             if not target_dir.is_dir():
                 print(f"no install at {target_dir}")
-                print(f"found installs: {[p.name for p in installs] or 'none'}")
+                print(f"found installs: {[p.name for p in all_installs]}")
                 return 1
             installs = [target_dir]
-
-        if not installs:
-            print("no claude-speak installs found under ~/.claude/plugins/data/")
-            return 0
+        elif args.all:
+            installs = all_installs
+        elif len(all_installs) == 1:
+            installs = all_installs
+        else:
+            print(f"{len(all_installs)} claude-speak installs found:")
+            for p in all_installs:
+                size = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+                marketplace = p.name[len("claude-speak-"):]
+                print(f"  {marketplace:30s}  {size // (1024 * 1024)}MB  ({p})")
+            print()
+            print("Refusing to wipe without an explicit choice. Pick one:")
+            print("  --target <marketplace>   wipe only that install")
+            print("  --all                    wipe all installs")
+            return 1
 
         if not args.force:
             print(f"This will wipe {len(installs)} claude-speak install(s):")
@@ -536,14 +559,13 @@ def main() -> int:
                 size = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
                 print(f"  {p}  ({size // (1024 * 1024)}MB)")
             print()
-            print("Contents of each: .venv/, kokoro/, models/, config.json, markers, lockfile.")
+            print("Contents: .venv/, kokoro/, models/, config.json, markers, lockfile.")
             if args.wipe_logs:
                 print("speak.log will ALSO be deleted (--wipe-logs).")
             else:
                 print("speak.log is preserved (pass --wipe-logs to also delete).")
             print()
             print("Re-run with --force to confirm.")
-            print("Use --target <marketplace> to wipe just one install.")
             return 1
 
         ok = True
