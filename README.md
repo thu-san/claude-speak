@@ -259,6 +259,26 @@ Every module has a single responsibility and a narrow public API. Adding a new T
 5. A player thread pulls audio in order and plays via `ffplay` stdin streaming.
 6. If `auto_dictation: true`: the hook waits for playback to end, records via sounddevice with silence detection, transcribes with whisper.cpp, and emits `{"decision":"block","reason":"..."}` so Claude Code treats the transcript as the next user prompt.
 
+## Latency budget
+
+Rough per-reply wall-clock on Intel i9 CPU, start of Stop hook → first audio:
+
+| Phase | Typical | Why |
+|---|---:|---|
+| Hook → daemon dispatch | <50ms | warm daemon, unix socket |
+| `claude -p` startup | **3–5s** | **Node.js startup + plugin sync + keychain reads + TLS + API round trip — CLI overhead, not model inference.** Unavoidable without an API key. |
+| Rewrite model inference | 1–2s | actual Sonnet response |
+| Kokoro first-sentence synth | 1–2s | ONNX on CPU, fp32 |
+| ffplay start | <200ms | |
+| **→ first audio at** | **~5–9s** | |
+
+The floor is `claude -p` overhead. If you're willing to set `ANTHROPIC_API_KEY` and hit `/v1/messages` directly, it drops to ~1s — but we keep the default path on subscription auth so users don't have to manage API keys. Document choice: simplicity > speed.
+
+Knobs that actually help on the current path:
+- `--setting-sources local` is already passed → skips hooks and MCPs from user/project settings (was the biggest unpredictable stall).
+- `mode: stream` (default) → you hear sentence 1 while sentence 2+N synthesize in parallel. Don't switch to `whole` unless you're benchmarking.
+- Apple Silicon cuts Kokoro + whisper times 3–5×. See [Future upgrade paths](#future-upgrade-paths-apple-silicon).
+
 ## Daemon
 
 A long-running Unix-socket daemon (`claude_speak.daemon`) keeps Python + Silero VAD + Kokoro + whisper.cpp models warm in memory across turns. Without it, every Stop hook spawns a fresh Python process and reloads everything from scratch (~10-15s of pure cold-start before the mic even opens).
