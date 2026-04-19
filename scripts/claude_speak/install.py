@@ -352,6 +352,50 @@ def _find_install_dirs() -> list[Path]:
     )
 
 
+def _plugin_bindings() -> tuple[Path | None, list[str]]:
+    """Inspect Claude Code's settings files for claude-speak@<marketplace>
+    bindings.
+
+    Returns (active_dir, disabled_marketplaces):
+      - active_dir: the ~/.claude/plugins/data/claude-speak-<marketplace>/
+        path for the FIRST enabled (True) claude-speak@X we find walking
+        project scope → user scope. None if nothing enabled.
+      - disabled_marketplaces: list of marketplace names bound but with
+        value False — useful for a helpful 'it's disabled' hint.
+
+    Search order: cwd + parents' .claude/settings{.local,}.json, then
+    ~/.claude/settings{.local,}.json. First enabled wins."""
+    import json
+    base = Path.home() / ".claude" / "plugins" / "data"
+    prefix = "claude-speak@"
+    candidates = []
+    cwd = Path.cwd().resolve()
+    for d in [cwd] + list(cwd.parents):
+        for name in ("settings.local.json", "settings.json"):
+            candidates.append(d / ".claude" / name)
+    home = Path.home() / ".claude"
+    candidates.extend([home / "settings.local.json", home / "settings.json"])
+    active: Path | None = None
+    disabled: list[str] = []
+    for p in candidates:
+        if not p.is_file():
+            continue
+        try:
+            data = json.loads(p.read_text())
+        except Exception:
+            continue
+        enabled = data.get("enabledPlugins", {})
+        for key, on in enabled.items():
+            if not isinstance(key, str) or not key.startswith(prefix):
+                continue
+            marketplace = key[len(prefix):]
+            if on and active is None:
+                active = base / f"claude-speak-{marketplace}"
+            elif not on and marketplace not in disabled:
+                disabled.append(marketplace)
+    return active, disabled
+
+
 def uninstall_all(keep_log: bool = True, quiet: bool = False,
                   data_dir: Path | None = None) -> bool:
     """Wipe one install's venv, downloaded models, markers, config.
@@ -524,11 +568,13 @@ def main() -> int:
             print("no claude-speak installs found under ~/.claude/plugins/data/")
             return 0
 
-        # Choose which install(s) to wipe. Three cases:
-        #   --target X       → just that one
-        #   --all            → every found install
-        #   (neither, one install found) → the single one (unambiguous)
-        #   (neither, 2+ found) → refuse; tell user to pick
+        # Choose which install(s) to wipe, in order of preference:
+        #   --target X    → just that one (explicit override)
+        #   --all         → every install on disk
+        #   (neither, currently-enabled claude-speak@X found via settings)
+        #                 → use that one (the install Claude Code is using)
+        #   (neither, exactly one dir on disk) → the single one
+        #   (neither, 2+ dirs, no active binding) → refuse; require explicit choice
         if args.target:
             target_dir = (Path.home() / ".claude" / "plugins" / "data"
                           / f"claude-speak-{args.target}")
@@ -539,19 +585,31 @@ def main() -> int:
             installs = [target_dir]
         elif args.all:
             installs = all_installs
-        elif len(all_installs) == 1:
-            installs = all_installs
         else:
-            print(f"{len(all_installs)} claude-speak installs found:")
-            for p in all_installs:
-                size = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
-                marketplace = p.name[len("claude-speak-"):]
-                print(f"  {marketplace:30s}  {size // (1024 * 1024)}MB  ({p})")
-            print()
-            print("Refusing to wipe without an explicit choice. Pick one:")
-            print("  --target <marketplace>   wipe only that install")
-            print("  --all                    wipe all installs")
-            return 1
+            active, disabled = _plugin_bindings()
+            if active is not None and active.is_dir():
+                installs = [active]
+                print(f"active install: {active.name} (from Claude Code settings)")
+            elif len(all_installs) == 1:
+                installs = all_installs
+            else:
+                if disabled:
+                    print(f"{len(all_installs)} claude-speak installs found; "
+                          f"bindings for {disabled} are currently disabled "
+                          f"in Claude Code (re-enable with /plugin to make "
+                          f"uninstall auto-target):")
+                else:
+                    print(f"{len(all_installs)} claude-speak installs found, "
+                          f"none currently enabled in Claude Code:")
+                for p in all_installs:
+                    size = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+                    marketplace = p.name[len("claude-speak-"):]
+                    print(f"  {marketplace:30s}  {size // (1024 * 1024)}MB  ({p})")
+                print()
+                print("Refusing to wipe without an explicit choice. Pick one:")
+                print("  --target <marketplace>   wipe only that install")
+                print("  --all                    wipe all installs")
+                return 1
 
         if not args.force:
             print(f"This will wipe {len(installs)} claude-speak install(s):")
