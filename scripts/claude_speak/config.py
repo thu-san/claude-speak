@@ -7,6 +7,46 @@ from pathlib import Path
 
 
 CANONICAL_DIR_NAME = "claude-speak-thu-san"
+PLUGIN_NAME = "claude-speak"
+
+
+def _enabled_marketplace() -> str | None:
+    """Read Claude Code's settings files to find the marketplace that the
+    currently-enabled claude-speak plugin came from.
+
+    Plugin keys in `enabledPlugins` look like `claude-speak@<marketplace>`,
+    e.g. `claude-speak@thu-san` (from GitHub) or
+    `claude-speak@claude-speak-local` (a local dev install). The data dir
+    name matches: `~/.claude/plugins/data/claude-speak-<marketplace>`.
+
+    Search order (highest priority first):
+      1. Project-scope: walk up from cwd looking for
+         `.claude/settings.local.json` then `.claude/settings.json`.
+      2. User-scope: `~/.claude/settings.local.json`, then
+         `~/.claude/settings.json`.
+    First enabled claude-speak@X wins. Returns the marketplace name or
+    None if claude-speak isn't enabled in any settings file.
+    """
+    prefix = f"{PLUGIN_NAME}@"
+    candidates = []
+    cwd = Path.cwd().resolve()
+    for d in [cwd] + list(cwd.parents):
+        for name in ("settings.local.json", "settings.json"):
+            candidates.append(d / ".claude" / name)
+    home = Path.home() / ".claude"
+    candidates.extend([home / "settings.local.json", home / "settings.json"])
+    for p in candidates:
+        if not p.is_file():
+            continue
+        try:
+            data = json.loads(p.read_text())
+        except Exception:
+            continue
+        enabled = data.get("enabledPlugins", {})
+        for key, on in enabled.items():
+            if on and isinstance(key, str) and key.startswith(prefix):
+                return key[len(prefix):]
+    return None
 
 
 def data_dir() -> Path:
@@ -14,30 +54,22 @@ def data_dir() -> Path:
 
     Order of preference:
       1. CLAUDE_PLUGIN_DATA — set by Claude Code for hook subprocesses.
-         Always wins. This is the only source of truth for "which marketplace
-         is actually active in the current session."
-      2. The most-recently-modified `~/.claude/plugins/data/claude-speak-*`
-         directory. Terminal invocations don't get CLAUDE_PLUGIN_DATA, so we
-         use recency as a proxy for "whichever install the user was just
-         using." That tracks correctly when the user has multiple
-         side-by-side installs (e.g. an @claude-speak-local dev install next
-         to a stale @thu-san from an earlier experiment) — the one Claude
-         Code just wrote to via the hook wins.
-      3. Fall back to the canonical path for the published marketplace.
+         Always wins.
+      2. Read ~/.claude/settings*.json for the currently-enabled
+         claude-speak@<marketplace> and use the matching data dir. This
+         makes terminal invocations follow whichever install the user has
+         active — without depending on file mtimes or env vars.
+      3. Fall back to the canonical dir for a fresh production install.
     """
     d = os.environ.get("CLAUDE_PLUGIN_DATA")
     if d:
         return Path(d)
     base = Path.home() / ".claude" / "plugins" / "data"
-    if base.is_dir():
-        candidates = [
-            e for e in base.iterdir()
-            if e.is_dir() and e.name.startswith("claude-speak")
-        ]
-        if candidates:
-            # Newest wins. Ties broken alphabetically for stability.
-            candidates.sort(key=lambda p: (-p.stat().st_mtime, p.name))
-            return candidates[0]
+    marketplace = _enabled_marketplace()
+    if marketplace:
+        candidate = base / f"{PLUGIN_NAME}-{marketplace}"
+        if candidate.is_dir():
+            return candidate
     return base / CANONICAL_DIR_NAME
 
 
