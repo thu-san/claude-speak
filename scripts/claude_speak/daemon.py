@@ -346,18 +346,33 @@ def _start_code_watchdog() -> None:
     def _watch() -> None:
         while True:
             time.sleep(30)
+            # Check _in_flight first as a cheap bailout, then acquire the
+            # request lock non-blocking — if we can't grab it, a request is
+            # either in flight or about to start and we must NOT exit this
+            # tick. Without this serialization, os._exit(0) can race an
+            # arriving request and leave the client hung until its 60/600s
+            # socket timeout.
             if _in_flight[0]:
                 continue
-            for p, t0 in snapshot.items():
-                t = _safe_mtime(p)
-                if t is not None and t0 is not None and t > t0:
-                    log(f"code change detected in {p.name} → shutting down (will respawn)")
-                    for q in (SOCKET_PATH, PID_FILE, START_LOCK):
-                        try:
-                            q.unlink()
-                        except FileNotFoundError:
-                            pass
-                    os._exit(0)
+            if not _request_lock.acquire(blocking=False):
+                continue
+            try:
+                # Recheck under lock — state could have changed between the
+                # unlocked check and here.
+                if _in_flight[0]:
+                    continue
+                for p, t0 in snapshot.items():
+                    t = _safe_mtime(p)
+                    if t is not None and t0 is not None and t > t0:
+                        log(f"code change detected in {p.name} → shutting down (will respawn)")
+                        for q in (SOCKET_PATH, PID_FILE, START_LOCK):
+                            try:
+                                q.unlink()
+                            except FileNotFoundError:
+                                pass
+                        os._exit(0)
+            finally:
+                _request_lock.release()
     threading.Thread(target=_watch, daemon=True).start()
 
 
