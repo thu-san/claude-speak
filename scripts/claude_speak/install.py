@@ -340,57 +340,93 @@ def install_all(cfg: dict | None = None, quiet: bool = False) -> bool:
     return all_ok
 
 
-def uninstall_all(keep_log: bool = True, quiet: bool = False) -> bool:
-    """Wipe the plugin's venv, downloaded models, markers, and config.
+def _find_install_dirs() -> list[Path]:
+    """All ~/.claude/plugins/data/claude-speak-* directories currently on disk.
+    Sorted alphabetically for stable output."""
+    base = Path.home() / ".claude" / "plugins" / "data"
+    if not base.is_dir():
+        return []
+    return sorted(
+        e for e in base.iterdir()
+        if e.is_dir() and e.name.startswith("claude-speak-")
+    )
 
-    Does NOT uninstall the plugin itself — run `/plugin uninstall claude-speak`
-    for that. This is the "reset my data" button: re-running install.py after
-    this will recreate everything from scratch.
+
+def uninstall_all(keep_log: bool = True, quiet: bool = False,
+                  data_dir: Path | None = None) -> bool:
+    """Wipe one install's venv, downloaded models, markers, config.
+
+    `data_dir` defaults to the module's DATA_DIR (the currently-active
+    install) for back-compat. Pass explicitly to target a specific sibling
+    install (e.g. an orphaned @thu-san dir next to your active @local one).
+
+    Does NOT remove the plugin from Claude Code — run `/plugin uninstall
+    claude-speak` for that. This is the "reset my data" button.
     """
     import os
-    if LOCK.exists():
+    dd = data_dir or DATA_DIR
+    lock = dd / ".install.lock"
+    if lock.exists():
         try:
-            pid = int(LOCK.read_text().strip())
+            pid = int(lock.read_text().strip())
             os.kill(pid, 0)
-            _say(f"an install is running (pid {pid}); refusing to uninstall", quiet)
+            _say(f"an install is running (pid {pid}) in {dd}; refusing to uninstall", quiet)
             return False
         except (ValueError, ProcessLookupError, PermissionError):
-            _release_lock()  # stale
+            try:
+                lock.unlink()
+            except FileNotFoundError:
+                pass
 
     # Stop the daemon BEFORE wiping files — otherwise it keeps running with
-    # stale references to the venv we're about to delete.
+    # stale references to the venv we're about to delete. Only targets the
+    # daemon that belongs to THIS data_dir (matches its socket path).
+    sock = dd / "daemon.sock"
     try:
-        from .daemon import _socket_alive, send_request, SOCKET_PATH
-        if _socket_alive():
-            _say("stopping daemon", quiet, notify_too=False)
-            send_request({"op": "shutdown"}, timeout=2)
+        if sock.exists():
+            import socket as _socket, json as _json
+            s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            s.settimeout(2)
+            try:
+                s.connect(str(sock))
+                s.sendall((_json.dumps({"op": "shutdown"}) + "\n").encode())
+                _say(f"stopping daemon at {sock}", quiet, notify_too=False)
+            except OSError:
+                pass
+            finally:
+                try:
+                    s.close()
+                except OSError:
+                    pass
             for _ in range(20):
-                if not SOCKET_PATH.exists():
+                if not sock.exists():
                     break
                 import time as _t
                 _t.sleep(0.1)
     except Exception:
         pass
 
-    _say(f"uninstalling plugin data at {DATA_DIR}", quiet)
+    _say(f"uninstalling plugin data at {dd}", quiet)
     targets = [
-        (DATA_DIR / ".venv", True),
-        (DATA_DIR / "kokoro", True),
-        (DATA_DIR / "models", True),
-        (DATA_DIR / "last.mp3", False),
-        (DATA_DIR / "last.wav", False),
-        (DATA_DIR / "input.wav", False),
-        (DATA_DIR / ".installed_v1", False),
-        (DATA_DIR / "requirements.lock", False),
-        (DATA_DIR / ".install.lock", False),
-        (DATA_DIR / "config.json", False),
-        (DATA_DIR / "daemon.pid", False),
-        (DATA_DIR / "daemon.sock", False),
-        (DATA_DIR / "daemon.start.lock", False),
-        (DATA_DIR / "player.pid", False),
+        (dd / ".venv", True),
+        (dd / "kokoro", True),
+        (dd / "models", True),
+        (dd / "last.mp3", False),
+        (dd / "last.wav", False),
+        (dd / "input.wav", False),
+        (dd / ".installed_v1", False),
+        (dd / "requirements.lock", False),
+        (dd / ".install.lock", False),
+        (dd / "config.json", False),
+        (dd / "daemon.pid", False),
+        (dd / "daemon.sock", False),
+        (dd / "daemon.start.lock", False),
+        (dd / "player.pid", False),
+        (dd / "pipeline.pid", False),
+        (dd / ".skip_next_turn", False),
     ]
     if not keep_log:
-        targets.append((DATA_DIR / "speak.log", False))
+        targets.append((dd / "speak.log", False))
 
     removed = 0
     total_bytes = 0
@@ -411,6 +447,24 @@ def uninstall_all(keep_log: bool = True, quiet: bool = False) -> bool:
             _say(f"  removed {path.name} ({size} bytes)", quiet, notify_too=False)
             removed += 1
             total_bytes += size
+
+    # If the dir is now empty (or only contains .DS_Store), remove it too —
+    # otherwise you'd see stale empty dirs under ~/.claude/plugins/data/.
+    try:
+        leftovers = [p for p in dd.iterdir() if p.name != ".DS_Store"]
+        if not leftovers:
+            for p in dd.iterdir():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+            try:
+                dd.rmdir()
+                _say(f"  removed empty dir {dd.name}/", quiet, notify_too=False)
+            except OSError:
+                pass
+    except FileNotFoundError:
+        pass
 
     _say(f"uninstall complete ({removed} items, {total_bytes // (1024 * 1024)}MB freed)",
          quiet)
@@ -447,21 +501,57 @@ def main() -> int:
                     help="double-fork and detach immediately, then run the install "
                     "in the background. Used by the SessionStart hook.")
     ap.add_argument("--uninstall", action="store_true",
-                    help="remove the venv, downloaded models, and all plugin data")
+                    help="remove the venv, downloaded models, and all plugin data "
+                    "for EVERY claude-speak install found under "
+                    "~/.claude/plugins/data/")
     ap.add_argument("--wipe-logs", action="store_true",
                     help="with --uninstall, also delete speak.log")
+    ap.add_argument("--target", metavar="MARKETPLACE",
+                    help="with --uninstall, wipe only the install for this "
+                    "marketplace (e.g. 'thu-san' or 'claude-speak-local') "
+                    "instead of all. Useful when you want to keep other "
+                    "side-by-side installs intact.")
     args = ap.parse_args()
 
     if args.uninstall:
+        installs = _find_install_dirs()
+        if args.target:
+            # Surgical: only the named marketplace.
+            target_dir = (Path.home() / ".claude" / "plugins" / "data"
+                          / f"claude-speak-{args.target}")
+            if not target_dir.is_dir():
+                print(f"no install at {target_dir}")
+                print(f"found installs: {[p.name for p in installs] or 'none'}")
+                return 1
+            installs = [target_dir]
+
+        if not installs:
+            print("no claude-speak installs found under ~/.claude/plugins/data/")
+            return 0
+
         if not args.force:
-            print(f"This will wipe {DATA_DIR}")
-            print("  - .venv/ (plugin-private Python env, ~1GB)")
-            print("  - kokoro/ and models/ (downloaded TTS and STT models)")
-            print("  - config.json, markers, lockfile")
+            print(f"This will wipe {len(installs)} claude-speak install(s):")
+            for p in installs:
+                size = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+                print(f"  {p}  ({size // (1024 * 1024)}MB)")
             print()
-            print("Re-run with --force to confirm (add --wipe-logs to also delete speak.log).")
+            print("Contents of each: .venv/, kokoro/, models/, config.json, markers, lockfile.")
+            if args.wipe_logs:
+                print("speak.log will ALSO be deleted (--wipe-logs).")
+            else:
+                print("speak.log is preserved (pass --wipe-logs to also delete).")
+            print()
+            print("Re-run with --force to confirm.")
+            print("Use --target <marketplace> to wipe just one install.")
             return 1
-        ok = uninstall_all(keep_log=not args.wipe_logs, quiet=args.quiet)
+
+        ok = True
+        for p in installs:
+            ok &= uninstall_all(
+                keep_log=not args.wipe_logs,
+                quiet=args.quiet,
+                data_dir=p,
+            )
         return 0 if ok else 1
 
     if not args.force and MARKER.exists():
