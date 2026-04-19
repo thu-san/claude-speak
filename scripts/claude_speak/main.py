@@ -118,11 +118,20 @@ def _resolve_voice_loop(cfg: dict) -> bool:
     return bool(cfg.get("auto_dictation", True))
 
 
-def _run_pipeline(cfg: dict, text: str) -> None:
+def _passthrough_stream(text: str, _cfg: dict):
+    """A no-op 'rewriter' that yields the input verbatim as one chunk.
+    Lets run_pipeline produce the full timing/section logs
+    (first audio at, total synth, play ~, done in) even when we skip
+    the claude -p rewrite step."""
+    yield text
+
+
+def _run_pipeline(cfg: dict, text: str, *, do_rewrite: bool = True) -> None:
     from .pipeline import run_pipeline
     def fetch(sentence: str) -> tuple[bytes, str]:
         return synthesize(sentence, cfg)
-    run_pipeline(cfg, rewrite_stream, fetch, text)
+    stream = rewrite_stream if do_rewrite else _passthrough_stream
+    run_pipeline(cfg, stream, fetch, text)
 
 
 def run_turn(req: dict, *, forked_fallback: bool = False) -> str:
@@ -176,9 +185,11 @@ def run_turn(req: dict, *, forked_fallback: bool = False) -> str:
     voice = cfg.get("kokoro_voice")
     rate = float(cfg.get("playback_rate", 1.0))
     mode = _resolve_mode(cfg)
-    # Pre-built text skips rewrite, so streaming-rewrite gains nothing —
-    # force buffered path for that case.
-    use_pipeline = (mode == "stream") and do_rewrite and (direct_text is None)
+    # The pipeline works even when rewrite is skipped — we pass a
+    # passthrough "rewriter" that yields the text unchanged. That way the
+    # caller gets the same timing section logs (🔊 SPEAK, 🔉 first audio at,
+    # ✅ done in, total synth, play ~) whether or not claude -p ran.
+    use_pipeline = (mode == "stream")
 
     section("🎤 TURN")
     log(f"📥 in: user={len(user_text)}c assistant={len(assistant_text)}c "
@@ -200,7 +211,7 @@ def run_turn(req: dict, *, forked_fallback: bool = False) -> str:
             try:
                 DATA_DIR.mkdir(parents=True, exist_ok=True)
                 DAEMON_PID_FILE.write_text(str(os.getpid()))
-                _run_pipeline(cfg, text)
+                _run_pipeline(cfg, text, do_rewrite=do_rewrite)
             except Exception as e:
                 log(f"❌ pipeline error: {type(e).__name__}: {e}")
             finally:
@@ -210,7 +221,7 @@ def run_turn(req: dict, *, forked_fallback: bool = False) -> str:
                     pass
             os._exit(0)
         try:
-            _run_pipeline(cfg, text)
+            _run_pipeline(cfg, text, do_rewrite=do_rewrite)
         except Exception as e:
             log(f"❌ pipeline error: {type(e).__name__}: {e}")
             return ""
