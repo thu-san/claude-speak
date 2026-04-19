@@ -107,9 +107,20 @@ def send_request(req: dict, timeout: float = 600.0) -> dict | None:
 
 
 def _spawn_daemon() -> None:
-    """Fork + detach + exec the daemon. Parent returns immediately."""
+    """Fork + detach + exec the daemon. Parent returns immediately.
+
+    PYTHONPATH is set explicitly to the scripts/ directory so `python -m
+    claude_speak.daemon` resolves the package regardless of the exec'd
+    child's cwd. Without this, the daemon would only start when the caller
+    happened to be running from scripts/ — broken for hook invocations
+    whose cwd is the user's project dir, not ours."""
     from .venv import VENV_PYTHON, venv_ready
     py = str(VENV_PYTHON) if venv_ready() else sys.executable
+    # claude_speak/daemon.py → claude_speak/.. = scripts/
+    scripts_dir = str(Path(__file__).resolve().parent.parent)
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = scripts_dir + (os.pathsep + existing if existing else "")
     pid = os.fork()
     if pid == 0:
         os.setsid()
@@ -121,7 +132,7 @@ def _spawn_daemon() -> None:
                 os.dup2(devnull, fd)
             except OSError:
                 pass
-        os.execv(py, [py, "-m", "claude_speak.daemon", "serve"])
+        os.execve(py, [py, "-m", "claude_speak.daemon", "serve"], env)
 
 
 def _wait_for_socket(timeout_s: float) -> bool:
