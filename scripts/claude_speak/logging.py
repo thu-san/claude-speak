@@ -42,6 +42,65 @@ def _rotate_if_needed() -> None:
         pass
 
 
+class tail_log_to_stderr:
+    """Context manager. While the block runs, tail new bytes appended to
+    speak.log and write them to stderr every 100ms. Used by CLIs that
+    block on a long-running daemon op so the user sees the daemon's
+    progress logs in their terminal instead of a silent wait.
+
+    Handles mid-request log rotation by tracking the file's inode — when
+    it changes, restarts reading from byte 0 of the new file."""
+
+    def __init__(self) -> None:
+        import threading
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "tail_log_to_stderr":
+        import threading
+        try:
+            st = LOG_PATH.stat()
+            start_offset = st.st_size
+            start_inode: int | None = st.st_ino
+        except FileNotFoundError:
+            start_offset = 0
+            start_inode = None
+        stop = self._stop
+
+        def _tail() -> None:
+            offset = start_offset
+            inode = start_inode
+            while True:
+                try:
+                    st = LOG_PATH.stat()
+                    if inode is None:
+                        inode = st.st_ino
+                    if st.st_ino != inode:
+                        offset = 0
+                        inode = st.st_ino
+                    if st.st_size > offset:
+                        with open(LOG_PATH, "rb") as f:
+                            f.seek(offset)
+                            chunk = f.read(st.st_size - offset)
+                            offset = st.st_size
+                        sys.stderr.write(chunk.decode("utf-8", errors="replace"))
+                        sys.stderr.flush()
+                except (FileNotFoundError, OSError):
+                    pass
+                if stop.is_set():
+                    return  # one final read above caught the tail
+                stop.wait(0.1)
+
+        self._thread = threading.Thread(target=_tail, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+
+
 def enable_stderr_tee(on: bool = True) -> None:
     """When enabled, log() and section() also write to stderr — useful for
     standalone CLI invocations so the user sees the same nice output that

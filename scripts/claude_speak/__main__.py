@@ -29,7 +29,7 @@ from pathlib import Path
 
 from .config import load_config
 from .defaults import DEFAULTS
-from .logging import enable_stderr_tee, log, section
+from .logging import enable_stderr_tee, log, section, tail_log_to_stderr
 
 
 def _write_fake_transcript(assistant_text: str, user_text: str) -> Path:
@@ -78,8 +78,13 @@ def _cmd_turn(args: argparse.Namespace) -> int:
                 log("daemon unreachable — falling back to in-process")
                 use_daemon = False
             else:
-                resp = send_request({"op": "turn", "transcript_path": str(transcript_path)},
-                                    timeout=600)
+                # Tail speak.log to stderr while the daemon works — otherwise
+                # we block silently for 15-30s and the user sees nothing.
+                with tail_log_to_stderr():
+                    resp = send_request(
+                        {"op": "turn", "transcript_path": str(transcript_path)},
+                        timeout=600,
+                    )
                 if not resp or not resp.get("ok"):
                     log(f"daemon turn failed: {resp}")
                     return 1
