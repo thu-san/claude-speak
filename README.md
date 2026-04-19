@@ -314,6 +314,46 @@ Claude Code fires a `Notification` hook whenever the UI needs your attention —
 - **Toggle**: `/speak notifications on|off` (global). Per-type toggles live under `speak_notification_types` in config — `permission_prompt` / `elicitation_dialog` / `idle_prompt` are on by default, `auth_success` is off.
 - **Interrupts the current turn**: if a notification arrives while Claude's reply is still being spoken, the reply gets cut so the notification is heard immediately. Permission prompts are higher priority.
 
+### Test the notification flow manually
+
+Waiting for a real permission prompt to fire is annoying. Three ways to exercise the path end-to-end:
+
+```bash
+cd /path/to/claude-speak/scripts
+
+# 1. Pipe a canned hook payload straight into the shim (closest to what
+#    Claude Code actually does — stdin JSON → daemon → speak).
+echo '{
+  "session_id": "x",
+  "hook_event_name": "Notification",
+  "message": "Claude needs your permission to use Bash",
+  "title": "Permission needed",
+  "notification_type": "permission_prompt"
+}' | python3 announce.py
+
+# 2. Skip the shim; talk to the daemon directly. Useful for probing the
+#    new turn-op fields without a JSON payload.
+python3 -c "
+from claude_speak.daemon import send_request
+print(send_request({
+    'op': 'turn',
+    'text': 'Heads up — the build finished.',
+    'rewrite': False,
+    'voice_loop': False,
+}))
+"
+
+# 3. Try a per-type filter: auth_success is OFF by default → this is silent.
+echo '{"session_id":"x","hook_event_name":"Notification","message":"Signed in.","notification_type":"auth_success"}' \
+  | python3 announce.py
+# Flip it on, then re-run above:
+python3 speak_config.py notifications on     # ensure global toggle on first
+# (edit config.json and set speak_notification_types.auth_success=true,
+#  or just test with a type that's on by default like permission_prompt)
+```
+
+All three tail through `speak.log` — look for the `🔔 notification (...)` line on the shim side and the `📥 in: ... rewrite=False direct_text=True` line from the daemon worker.
+
 ## Future upgrade paths (Apple Silicon)
 
 The current default — Kokoro for TTS — was chosen because it's the only local model that runs in real-time-ish on Intel CPU (~1-2s per sentence). It sounds good but slightly mechanical. On an Apple Silicon Mac (M2 and up), the Core ML / MPS / Neural Engine paths open up much more natural local TTS options:
