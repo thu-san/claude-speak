@@ -87,6 +87,7 @@ After that, everything runs fully offline.
 | `/speak silence <0.3-10>` | Silence seconds before recording stops |
 | `/speak mode stream \| whole` | `stream`: play sentence-by-sentence (fast first audio). `whole`: one big synthesis then play (smoother prosody, slower start) |
 | `/speak dictate on \| off` | Enable the hands-free voice loop |
+| `/speak notifications on \| off` | Speak Claude Code notifications (permission prompts, idle, etc.) aloud |
 | `/speak status` | Show config + tooling availability |
 | `/claude-speak:daemon-status` | Show daemon uptime / pid / in-flight |
 | `/claude-speak:daemon-restart` | Restart the daemon (pick up code changes) |
@@ -304,6 +305,14 @@ A long-running Unix-socket daemon (`claude_speak.daemon`) keeps Python + Silero 
 - Both the Stop hook (`scripts/speak.py`) and the standalone CLI (`python -m claude_speak.stt`) route through it via `stt.dictate(cfg)` — that's the single public entry point; routing is internal.
 - Pass `--no-daemon` to the CLI, or set `daemon: false` in config, to bypass.
 - `/claude-speak:daemon-status` / `daemon-restart` / `daemon-stop` to manage it.
+
+## Notifications
+
+Claude Code fires a `Notification` hook whenever the UI needs your attention — permission prompts ("Claude needs your permission to use Bash"), MCP elicitation dialogs, idle-waiting reminders, auth-success. claude-speak speaks those aloud so you can work with headphones on and still know when the turn is blocked on your click. The plugin doesn't (and can't) auto-approve — the decision still happens in the UI; it just tells you it's there.
+
+- **How it works**: `scripts/announce.py` receives the hook JSON, routes to the daemon's `turn` op with `text=<message> rewrite=False voice_loop=False`. Spoken verbatim (no 3-5s `claude -p` floor) and speak-only (no mic recording afterward).
+- **Toggle**: `/speak notifications on|off` (global). Per-type toggles live under `speak_notification_types` in config — `permission_prompt` / `elicitation_dialog` / `idle_prompt` are on by default, `auth_success` is off.
+- **Interrupts the current turn**: if a notification arrives while Claude's reply is still being spoken, the reply gets cut so the notification is heard immediately. Permission prompts are higher priority.
 
 ## Future upgrade paths (Apple Silicon)
 
