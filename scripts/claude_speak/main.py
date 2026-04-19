@@ -33,16 +33,30 @@ PID_FILE = DATA_DIR / "player.pid"
 DAEMON_PID_FILE = DATA_DIR / "daemon.pid"
 
 
+def _pid_is_ours(pid: int) -> bool:
+    """True if `pid` is alive AND owned by the current user.
+    PermissionError from kill(pid,0) means the pid belongs to someone
+    else — protects against PID reuse after a reboot."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
 def _kill_previous() -> None:
     """Kill OUR last playback / pipeline daemon. Used to be a `pkill -f
     ffplay` which would also nuke unrelated user processes. Now scoped to
-    the pids we actually wrote to PID_FILE / DAEMON_PID_FILE."""
+    the pids we actually wrote to PID_FILE / DAEMON_PID_FILE — and further
+    guarded by an ownership check so a stale PID file that got reused by
+    someone else's process doesn't cause us to SIGKILL strangers."""
     killed = False
     if DAEMON_PID_FILE.exists():
         try:
             pid = int(DAEMON_PID_FILE.read_text().strip())
-            os.killpg(pid, signal.SIGTERM)
-            killed = True
+            if _pid_is_ours(pid):
+                os.killpg(pid, signal.SIGTERM)
+                killed = True
         except (ProcessLookupError, ValueError, PermissionError):
             pass
         try:
@@ -52,8 +66,9 @@ def _kill_previous() -> None:
     if PID_FILE.exists():
         try:
             pid = int(PID_FILE.read_text().strip())
-            os.kill(pid, signal.SIGTERM)
-            killed = True
+            if _pid_is_ours(pid):
+                os.kill(pid, signal.SIGTERM)
+                killed = True
         except (ProcessLookupError, ValueError, PermissionError):
             pass
         try:
@@ -161,14 +176,16 @@ def run_turn(req: dict, *, forked_fallback: bool = False) -> str:
     if not cfg.get("enabled", True):
         return ""
 
-    direct_text = req.get("text")
+    # Truthy check (not `is not None`) so an empty string falls through to
+    # the transcript branch — callers sending text="" meant "no text".
+    direct_text = req.get("text") or None
     do_rewrite = bool(req.get("rewrite", True))
     if "voice_loop" in req:
         voice_loop = bool(req["voice_loop"])
     else:
         voice_loop = _resolve_voice_loop(cfg)
 
-    if direct_text is not None:
+    if direct_text:
         # Notification-style path: pre-built text, no transcript read.
         user_text = ""
         assistant_text = direct_text
@@ -194,7 +211,7 @@ def run_turn(req: dict, *, forked_fallback: bool = False) -> str:
     section("🎤 TURN")
     log(f"📥 in: user={len(user_text)}c assistant={len(assistant_text)}c "
         f"voice={voice} rate={rate}x mode={mode} voice_loop={voice_loop} "
-        f"rewrite={do_rewrite} direct_text={direct_text is not None}")
+        f"rewrite={do_rewrite} direct_text={bool(direct_text)}")
     if user_text:
         log(f"   user: {user_text[:200]!r}")
 

@@ -44,6 +44,11 @@ PID_FILE = DATA_DIR / "daemon.pid"
 START_LOCK = DATA_DIR / "daemon.start.lock"
 
 
+_MAX_MSG_BYTES = 1 * 1024 * 1024  # 1 MiB — one speak/dictate payload is < 10 KiB;
+                                   # cap is only here to stop pathological
+                                   # clients from OOM'ing the daemon.
+
+
 # ---- client side ----
 
 def _socket_alive() -> bool:
@@ -77,13 +82,16 @@ def send_request(req: dict, timeout: float = 600.0) -> dict | None:
         return None
     try:
         s.sendall((json.dumps(req) + "\n").encode("utf-8"))
-        # Read until newline.
+        # Read until newline, capped so a buggy server can't OOM us.
         buf = b""
         while b"\n" not in buf:
             chunk = s.recv(4096)
             if not chunk:
                 break
             buf += chunk
+            if len(buf) > _MAX_MSG_BYTES:
+                log(f"daemon reply exceeded {_MAX_MSG_BYTES} bytes; aborting")
+                return None
         if not buf:
             return None
         line, _, _ = buf.partition(b"\n")
@@ -149,24 +157,42 @@ def _daemon_responsive() -> bool:
     return bool(resp and resp.get("ok"))
 
 
+def _pid_is_ours(pid: int) -> bool:
+    """True if `pid` is alive AND owned by the current user.
+
+    os.kill(pid, 0) raises PermissionError when the PID exists but belongs
+    to someone else (common after a reboot + PID reuse), ProcessLookupError
+    when the PID isn't live. We signal only when neither error fires."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
 def _kill_held_daemon() -> None:
     """Best-effort: terminate the daemon process named in PID_FILE, then
-    clean up its socket / pid / start lock so a fresh spawn can bind."""
+    clean up its socket / pid / start lock so a fresh spawn can bind.
+
+    Only signals the PID if ownership looks right — stale PID files are
+    routine here (crashes, reboots), and on macOS PIDs recycle fast, so
+    naive `os.kill(pid_from_file)` could SIGKILL a stranger."""
     if PID_FILE.exists():
         try:
             pid = int(PID_FILE.read_text().strip())
-            os.kill(pid, signal.SIGTERM)
-            for _ in range(20):
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    break
-                time.sleep(0.1)
+            if not _pid_is_ours(pid):
+                log(f"stale/foreign pid {pid} in {PID_FILE.name}; skipping kill")
             else:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                os.kill(pid, signal.SIGTERM)
+                for _ in range(20):
+                    if not _pid_is_ours(pid):
+                        break
+                    time.sleep(0.1)
+                else:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
         except (ValueError, ProcessLookupError, PermissionError):
             pass
     for p in (SOCKET_PATH, PID_FILE, START_LOCK):
@@ -270,6 +296,14 @@ def _client_thread(conn: socket.socket) -> None:
             if not chunk:
                 return
             buf += chunk
+            if len(buf) > _MAX_MSG_BYTES:
+                try:
+                    conn.sendall(
+                        (json.dumps({"ok": False, "error": "request too large"})
+                         + "\n").encode("utf-8"))
+                except OSError:
+                    pass
+                return
         line, _, _ = buf.partition(b"\n")
         try:
             req = json.loads(line.decode("utf-8"))
