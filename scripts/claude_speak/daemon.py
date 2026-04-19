@@ -237,18 +237,20 @@ def _handle(req: dict) -> dict:
                 return {"ok": False, "error": str(e)}
             finally:
                 _in_flight[0] = False
-    if op == "speak":
-        # Serialize speak requests; new request kills any in-flight playback.
-        from .main import _kill_previous, run_speak_via_daemon
+    # "turn" is the full conversational turn (rewrite → speak → listen →
+    # feedback). "speak" is kept as an alias for one release so pre-rename
+    # shims don't immediately break after a user pulls.
+    if op in ("turn", "speak"):
+        from .main import _kill_previous, run_turn
         if _in_flight[0]:
             _kill_previous()
         with _request_lock:
             _in_flight[0] = True
             try:
-                stdout = run_speak_via_daemon(req)
+                stdout = run_turn(req)
             except Exception as e:
                 import traceback
-                log(f"daemon speak error: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+                log(f"daemon turn error: {type(e).__name__}: {e}\n{traceback.format_exc()}")
                 return {"ok": False, "error": str(e)}
             finally:
                 _in_flight[0] = False

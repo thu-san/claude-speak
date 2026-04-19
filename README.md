@@ -127,7 +127,15 @@ Override `CLAUDE_SPEAK=0` in the environment to mute for a single session.
 
 ## Testing individual modules from the CLI
 
-Each backend is its own module and can run standalone. Useful for benchmarking inference speed or debugging.
+Each backend — rewrite, TTS, STT, daemon — is its own module and can run standalone. Pipeline from Stop hook:
+
+```
+raw Claude reply → rewrite (claude -p) → TTS (Kokoro) → ffplay → record (Silero VAD) → STT (whisper.cpp) → decision:block
+   └─ debug with ─┘   └──── debug with ────┘                     └─────────── debug with ────────────────┘
+    rewrite CLI       tts.kokoro CLI                              stt CLI
+```
+
+Invoke any layer in isolation to identify where time goes or what's broken without the full hook flow.
 
 ```bash
 # path to the checkout; adjust if installed elsewhere

@@ -23,7 +23,7 @@ def _try_daemon(payload: dict) -> bool:
     from claude_speak.daemon import ensure_daemon, send_request
     if not ensure_daemon():
         return False
-    resp = send_request({"op": "speak", "transcript_path": payload.get("transcript_path", "")})
+    resp = send_request({"op": "turn", "transcript_path": payload.get("transcript_path", "")})
     if not resp or not resp.get("ok"):
         return False
     out = resp.get("stdout") or ""
@@ -35,6 +35,13 @@ def _try_daemon(payload: dict) -> bool:
 
 
 def main() -> int:
+    import os
+    # Short-circuit before any real work: nested `claude -p` calls set
+    # CLAUDE_SPEAK=0 to prevent the rewrite call from firing its own Stop
+    # hook (infinite recursion).
+    if os.environ.get("CLAUDE_SPEAK") == "0":
+        return 0
+
     raw = sys.stdin.read()
     try:
         payload = json.loads(raw or "{}")
@@ -42,6 +49,8 @@ def main() -> int:
         payload = {}
 
     cfg = load_config(DEFAULTS)
+    if not cfg.get("enabled", True):
+        return 0
     if cfg.get("daemon", True):
         try:
             if _try_daemon(payload):

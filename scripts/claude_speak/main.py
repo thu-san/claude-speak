@@ -1,8 +1,16 @@
-"""Stop-hook entrypoint. Reads the transcript JSONL from stdin, rewrites the
-last assistant turn via `claude -p`, synthesizes via Kokoro, plays it back.
+"""Stop-hook entrypoint. One conversational turn per invocation:
 
-With auto_dictation=on, playback runs synchronously and then a mic recording +
-whisper.cpp transcription is fed back to Claude via a decision:block payload.
+    claude raw reply → claude -p rewrite → Kokoro TTS → ffplay
+      → (if voice_loop) record mic → whisper.cpp → decision:block JSON
+
+Two entry paths:
+
+- `run_turn(req)`: called by the daemon for each "turn" op. Runs the full
+  flow in-process (the daemon is the long-running process — no forking).
+  Returns the decision:block JSON string (empty if nothing to feed back).
+
+- `main()`: in-process fallback, used only when the daemon is unreachable.
+  Reads request payload from stdin, calls run_turn, prints stdout.
 """
 from __future__ import annotations
 
@@ -27,15 +35,12 @@ DAEMON_PID_FILE = DATA_DIR / "daemon.pid"
 
 def _kill_previous() -> None:
     """Kill OUR last playback / pipeline daemon. Used to be a `pkill -f
-    ffplay` which would also nuke unrelated user processes (e.g. someone
-    else using ffplay outside this plugin). Now scoped to the pids we
-    actually wrote to PID_FILE / DAEMON_PID_FILE."""
+    ffplay` which would also nuke unrelated user processes. Now scoped to
+    the pids we actually wrote to PID_FILE / DAEMON_PID_FILE."""
     killed = False
     if DAEMON_PID_FILE.exists():
         try:
             pid = int(DAEMON_PID_FILE.read_text().strip())
-            # Negative pid = process group → kills the daemonized pipeline
-            # along with any ffplay it spawned.
             os.killpg(pid, signal.SIGTERM)
             killed = True
         except (ProcessLookupError, ValueError, PermissionError):
@@ -77,13 +82,8 @@ def _daemonize() -> None:
             pass
 
 
-def _dictate_and_emit(cfg: dict) -> str:
-    """Run dictation; return the decision:block JSON to print, or empty string.
-
-    Dictation always runs in the same process as the speak that invoked it
-    (use_daemon=False) — either we ARE the daemon, or speak fell back to
-    in-process and the daemon path would fail anyway.
-    """
+def _listen_and_emit(cfg: dict) -> str:
+    """Listen for the user's voice reply, return decision:block JSON (or '')."""
     section("🎙️  DICTATION")
     try:
         dictated = stt_dictate(cfg, use_daemon=False)
@@ -103,18 +103,40 @@ def _dictate_and_emit(cfg: dict) -> str:
     return json.dumps({"decision": "block", "reason": reason})
 
 
-def _run_pipeline_daemon(cfg: dict, text: str) -> None:
+def _resolve_mode(cfg: dict) -> str:
+    """Stream vs whole. Honors legacy 'pipeline_sentences' bool."""
+    if "mode" not in cfg and "pipeline_sentences" in cfg:
+        return "stream" if cfg["pipeline_sentences"] else "whole"
+    return cfg.get("mode", "stream")
+
+
+def _resolve_voice_loop(cfg: dict) -> bool:
+    """voice_loop is the new name; auto_dictation is the legacy key we still
+    read from existing configs."""
+    if "voice_loop" in cfg:
+        return bool(cfg["voice_loop"])
+    return bool(cfg.get("auto_dictation", True))
+
+
+def _run_pipeline(cfg: dict, text: str) -> None:
     from .pipeline import run_pipeline
     def fetch(sentence: str) -> tuple[bytes, str]:
         return synthesize(sentence, cfg)
     run_pipeline(cfg, rewrite_stream, fetch, text)
 
 
-def run_speak_via_daemon(req: dict) -> str:
-    """Daemon-side speak handler. Same flow as main() but no forking — the
-    daemon is the long-running process — and stdout (the decision:block JSON
-    for auto-dictation) is returned as a string for the daemon to relay to
-    the hook client."""
+def run_turn(req: dict, *, forked_fallback: bool = False) -> str:
+    """One full conversational turn. Returns the decision:block JSON string
+    for the shim to print (or '' when there's nothing to feed back).
+
+    `forked_fallback=False` (default, daemon path): everything runs in this
+    process; no subprocess forking. Playback is streamed synchronously so
+    the listen step can start right after audio ends.
+
+    `forked_fallback=True` (speak-only path when daemon unreachable AND
+    voice_loop=False): fork+daemonize so the Stop hook returns quickly
+    and playback continues in the background.
+    """
     cfg = load_config(DEFAULTS)
     if not cfg.get("enabled", True):
         return ""
@@ -127,30 +149,47 @@ def run_speak_via_daemon(req: dict) -> str:
 
     voice = cfg.get("kokoro_voice")
     rate = float(cfg.get("playback_rate", 1.0))
-    auto_dictation = bool(cfg.get("auto_dictation", False))
-    if "mode" not in cfg and "pipeline_sentences" in cfg:
-        mode = "stream" if cfg["pipeline_sentences"] else "whole"
-    else:
-        mode = cfg.get("mode", "stream")
+    voice_loop = _resolve_voice_loop(cfg)
+    mode = _resolve_mode(cfg)
     use_pipeline = (mode == "stream")
-    section("🎤 STOP HOOK (daemon)")
+
+    section("🎤 TURN")
     log(f"📥 in: user={len(user_text)}c assistant={len(assistant_text)}c "
-        f"voice={voice} rate={rate}x mode={mode} dictate={auto_dictation}")
+        f"voice={voice} rate={rate}x mode={mode} voice_loop={voice_loop}")
     if user_text:
         log(f"   user: {user_text[:200]!r}")
     log_v(f"transcript={transcript_path}")
 
     if use_pipeline:
+        # In voice-loop mode we must run playback synchronously so the listen
+        # step can start right after audio ends. In speak-only mode on the
+        # in-process fallback, fork so the hook returns quickly.
+        if forked_fallback and not voice_loop:
+            pid = os.fork()
+            if pid > 0:
+                log_v(f"pipeline forking first_child={pid}")
+                return ""
+            _daemonize()
+            try:
+                DATA_DIR.mkdir(parents=True, exist_ok=True)
+                DAEMON_PID_FILE.write_text(str(os.getpid()))
+                _run_pipeline(cfg, text)
+            except Exception as e:
+                log(f"❌ pipeline error: {type(e).__name__}: {e}")
+            finally:
+                try:
+                    DAEMON_PID_FILE.unlink()
+                except FileNotFoundError:
+                    pass
+            os._exit(0)
         try:
-            _run_pipeline_daemon(cfg, text)
+            _run_pipeline(cfg, text)
         except Exception as e:
             log(f"❌ pipeline error: {type(e).__name__}: {e}")
             return ""
-        if auto_dictation:
-            return _dictate_and_emit(cfg)
-        return ""
+        return _listen_and_emit(cfg) if voice_loop else ""
 
-    # Buffered path.
+    # Buffered path: synthesize the whole rewrite as one audio chunk.
     try:
         spoken = rewrite(text, cfg)
         if not spoken:
@@ -162,10 +201,10 @@ def run_speak_via_daemon(req: dict) -> str:
         if not audio:
             log("tts synthesis returned no audio")
             return ""
-        if auto_dictation:
+        if voice_loop:
             play_synchronous(audio, ext, cfg)
-            log("✅ buffered playback done (auto_dictation)")
-            return _dictate_and_emit(cfg)
+            log("✅ buffered playback done")
+            return _listen_and_emit(cfg)
         pid = play_async(audio, ext, cfg)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         PID_FILE.write_text(str(pid))
@@ -175,7 +214,13 @@ def run_speak_via_daemon(req: dict) -> str:
     return ""
 
 
+# Legacy alias. Kept so daemon.py's older op handler still resolves if a
+# user hasn't restarted the daemon after pulling. Remove once we're past v1.
+run_speak_via_daemon = run_turn
+
+
 def main() -> int:
+    """In-process fallback. Only used when the daemon is unreachable."""
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except json.JSONDecodeError:
@@ -187,90 +232,10 @@ def main() -> int:
     if os.environ.get("CLAUDE_SPEAK") == "0":
         return 0
 
-    transcript_path = payload.get("transcript_path") or ""
-    user_text, assistant_text = read_last_turn(transcript_path)
-    if not assistant_text or len(assistant_text) < 4:
-        return 0
-    max_chars = int(cfg.get("max_chars", 1200))
-    text = build_rewrite_input(user_text, assistant_text, max_chars)
-
     _kill_previous()
-
-    voice = cfg.get("kokoro_voice")
-    rate = float(cfg.get("playback_rate", 1.0))
-    auto_dictation = bool(cfg.get("auto_dictation", False))
-    # Back-compat: old configs used "pipeline_sentences": bool. Honor it when
-    # the new "mode" key isn't explicitly set.
-    if "mode" not in cfg and "pipeline_sentences" in cfg:
-        mode = "stream" if cfg["pipeline_sentences"] else "whole"
-    else:
-        mode = cfg.get("mode", "stream")
-    use_pipeline = (mode == "stream")
-    section("🎤 STOP HOOK")
-    log(f"📥 in: user={len(user_text)}c assistant={len(assistant_text)}c "
-        f"voice={voice} rate={rate}x mode={mode} dictate={auto_dictation}")
-    if user_text:
-        log(f"   user: {user_text[:200]!r}")
-    log_v(f"transcript={transcript_path}")
-
-    if use_pipeline:
-        if auto_dictation:
-            # Synchronous pipeline — the hook needs to know when audio ends
-            # before triggering STT.
-            try:
-                _run_pipeline_daemon(cfg, text)
-            except Exception as e:
-                log(f"❌ pipeline error: {type(e).__name__}: {e}")
-            out = _dictate_and_emit(cfg)
-            if out:
-                print(out)
-            return 0
-
-        # Background: fork + daemonize so the hook returns immediately.
-        pid = os.fork()
-        if pid > 0:
-            log_v(f"pipeline forking first_child={pid}")
-            return 0
-        _daemonize()
-        try:
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            DAEMON_PID_FILE.write_text(str(os.getpid()))
-            _run_pipeline_daemon(cfg, text)
-        except Exception as e:
-            log(f"❌ pipeline error: {type(e).__name__}: {e}")
-        finally:
-            try:
-                DAEMON_PID_FILE.unlink()
-            except FileNotFoundError:
-                pass
-        os._exit(0)
-
-    # Buffered path: synthesize the whole rewrite as one audio chunk.
-    try:
-        spoken = rewrite(text, cfg)
-        if not spoken:
-            log("❌ rewrite returned empty")
-            return 0
-        log(f"✍️  rewrite done → {len(spoken)}c")
-        log(f"   speech: {spoken[:400]!r}")
-        audio, ext = synthesize(spoken, cfg)
-        if not audio:
-            log("tts synthesis returned no audio")
-            return 0
-        if auto_dictation:
-            play_synchronous(audio, ext, cfg)
-            log("✅ buffered playback done (auto_dictation)")
-            out = _dictate_and_emit(cfg)
-            if out:
-                print(out)
-            return 0
-        pid = play_async(audio, ext, cfg)
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        PID_FILE.write_text(str(pid))
-        log_v(f"buffered playback started pid={pid}")
-    except Exception as e:
-        log(f"❌ error: {type(e).__name__}: {e}")
-        return 0
+    out = run_turn(payload, forked_fallback=True)
+    if out:
+        print(out)
     return 0
 
 
